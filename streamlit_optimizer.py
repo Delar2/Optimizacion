@@ -17,7 +17,7 @@ st.set_page_config(
 )
 
 
-DEFAULT_SEPARATIONS = [100, 150, 200, 300, 500]
+DEFAULT_SEPARATIONS = [2, 3, 4, 5, 6, 8, 10, 12, 15, 20]
 DEFAULT_LAB_TYPES = [
     "Mineralógico",
     "Biogeoquímico",
@@ -269,6 +269,98 @@ def points_from_perimeter(perimeter: float, separation: float) -> int:
     return max(1, int(math.ceil(perimeter / separation)))
 
 
+
+def min_multilevel_by_perimeter(perimeter: float) -> int:
+    """Regla adaptativa para el MILP mejorado."""
+    if perimeter < 200:
+        return 1
+    if perimeter < 500:
+        return 2
+    if perimeter < 1000:
+        return 3
+    return 4
+
+
+def compute_plan_metrics(
+    circles_df: pd.DataFrame,
+    separations_selected: Dict[str, float],
+    multilevel_selected: Dict[str, int],
+    lab_samples: Dict[str, int],
+    y_24h: int,
+    y_ext: int,
+    teams: int,
+    hours_per_day: float,
+    daily_cost: float,
+    t_standard: float,
+    t_multilevel: float,
+    t_24h: float,
+    t_extended: float,
+    w_standard: float,
+    w_multilevel: float,
+    w_24h: float,
+    w_extended: float,
+    w_lab: Dict[str, float],
+    lab_costs: Dict[str, float],
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float]]:
+    rows = []
+    standard_total = 0
+    multilevel_total = 0
+    for _, row in circles_df.iterrows():
+        c = str(row["Círculo"])
+        p = float(row["Perímetro (m)"])
+        s = float(separations_selected[c])
+        pts = points_from_perimeter(p, s)
+        mpts = int(multilevel_selected[c])
+        standard_total += pts
+        multilevel_total += mpts
+        rows.append({
+            "Círculo": c,
+            "Perímetro (m)": p,
+            "Separación seleccionada (m)": s,
+            "Puntos estándar": pts,
+            "Puntos multinivel": mpts,
+            "Total puntos": pts + mpts,
+        })
+
+    strategy_df = pd.DataFrame(rows)
+    lab_df = pd.DataFrame({
+        "Tipo de análisis": list(lab_samples.keys()),
+        "Muestras": [int(lab_samples[k]) for k in lab_samples],
+        "Costo unitario": [lab_costs[k] for k in lab_samples],
+        "Costo total": [int(lab_samples[k]) * lab_costs[k] for k in lab_samples],
+    })
+
+    total_h = (
+        t_standard * standard_total
+        + t_multilevel * multilevel_total
+        + t_24h * y_24h
+        + t_extended * y_ext
+    )
+    operation_days = total_h / max(hours_per_day, 1e-6)
+    calendar_days_est = total_h / max(hours_per_day * teams, 1e-6)
+    lab_total = float(lab_df["Costo total"].sum())
+    operation_total = operation_days * daily_cost
+    quality = (
+        w_standard * standard_total
+        + w_multilevel * multilevel_total
+        + w_24h * y_24h
+        + w_extended * y_ext
+        + sum(w_lab[k] * lab_samples[k] for k in lab_samples)
+    )
+    metrics = {
+        "Calidad científica": float(quality),
+        "Horas de trabajo": float(total_h),
+        "Días-equipo operativos": float(operation_days),
+        "Días calendario estimados": float(calendar_days_est),
+        "Equipos": int(teams),
+        "Mediciones 24 h": int(y_24h),
+        "Mediciones extendidas": int(y_ext),
+        "Costo operativo": float(operation_total),
+        "Costo laboratorio": float(lab_total),
+        "Costo total": float(operation_total + lab_total),
+    }
+    return strategy_df, lab_df, metrics
+
 def solve_model(
     circles_df: pd.DataFrame,
     separations: List[int],
@@ -292,6 +384,9 @@ def solve_model(
     w_extended: float,
     w_lab: Dict[str, float],
     lab_costs: Dict[str, float],
+    model_variant: str = "MILP actual",
+    multilevel_rule: str = "Fijo por círculo",
+    multilevel_pct: float = 0.10,
 ) -> Tuple[str, pd.DataFrame, pd.DataFrame, Dict[str, float]]:
     circles = circles_df["Círculo"].astype(str).tolist()
     perimeter = dict(zip(circles, circles_df["Perímetro (m)"].astype(float)))
@@ -340,7 +435,19 @@ def solve_model(
 
     for i in circles:
         model += pulp.lpSum(x[i][s] for s in separations) == 1, f"R4_separacion_unica_{i}"
-        model += m[i] >= min_multilevel_per_circle, f"R7_min_multinivel_{i}"
+
+        selected_standard_points_i = pulp.lpSum(n_points[(i, s)] * x[i][s] for s in separations)
+
+        if model_variant == "MILP mejorado" and multilevel_rule == "Según perímetro":
+            model += m[i] >= min_multilevel_by_perimeter(perimeter[i]), f"R7_min_multinivel_perimetro_{i}"
+        elif model_variant == "MILP mejorado" and multilevel_rule == "Porcentaje de puntos estándar":
+            model += m[i] >= multilevel_pct * selected_standard_points_i, f"R7_min_multinivel_porcentaje_{i}"
+        else:
+            model += m[i] >= min_multilevel_per_circle, f"R7_min_multinivel_fijo_{i}"
+
+        # Límite superior para evitar soluciones artificialmente intensivas.
+        if model_variant == "MILP mejorado":
+            model += m[i] <= selected_standard_points_i, f"R7_max_multinivel_{i}"
 
     model += y_24h >= min_24h, "R5_min_24h"
     model += y_ext >= min_extended, "R5_min_extendidas"
@@ -414,6 +521,158 @@ def solve_model(
     return status, strategy_df, lab_df, metrics
 
 
+def solve_genetic(
+    circles_df: pd.DataFrame,
+    separations: List[int],
+    lab_types: List[str],
+    total_days: float,
+    hours_per_day: float,
+    budget: float,
+    daily_cost: float,
+    t_standard: float,
+    t_multilevel: float,
+    t_24h: float,
+    t_extended: float,
+    min_multilevel_per_circle: int,
+    min_24h: int,
+    min_extended: int,
+    min_lab_samples: Dict[str, int],
+    max_teams: int,
+    w_standard: float,
+    w_multilevel: float,
+    w_24h: float,
+    w_extended: float,
+    w_lab: Dict[str, float],
+    lab_costs: Dict[str, float],
+    generations: int = 120,
+    population_size: int = 80,
+    mutation_rate: float = 0.12,
+    multilevel_rule: str = "Según perímetro",
+    multilevel_pct: float = 0.10,
+) -> Tuple[str, pd.DataFrame, pd.DataFrame, Dict[str, float]]:
+    """Algoritmo genético simple sin librerías externas.
+
+    Nota: es una heurística. Busca una solución buena, pero no garantiza el óptimo global.
+    """
+    rng = np.random.default_rng(42)
+    circles = circles_df["Círculo"].astype(str).tolist()
+    perimeter = dict(zip(circles, circles_df["Perímetro (m)"].astype(float)))
+    max_hours = total_days * hours_per_day * max_teams
+
+    def min_m_for(c: str, sep: float) -> int:
+        std = points_from_perimeter(perimeter[c], sep)
+        if multilevel_rule == "Según perímetro":
+            return min_multilevel_by_perimeter(perimeter[c])
+        if multilevel_rule == "Porcentaje de puntos estándar":
+            return max(1, int(math.ceil(multilevel_pct * std)))
+        return int(min_multilevel_per_circle)
+
+    def random_individual():
+        sep_idx = rng.integers(0, len(separations), size=len(circles)).tolist()
+        mvals = []
+        for c, idx in zip(circles, sep_idx):
+            sep = separations[idx]
+            std = points_from_perimeter(perimeter[c], sep)
+            mn = min_m_for(c, sep)
+            mx = max(mn, std)
+            mvals.append(int(rng.integers(mn, mx + 1)))
+        y24 = int(rng.integers(min_24h, max(min_24h + 1, min_24h + 6)))
+        yext = int(rng.integers(min_extended, max(min_extended + 1, min_extended + 4)))
+        teams = int(rng.integers(1, max_teams + 1))
+        return {"sep_idx": sep_idx, "m": mvals, "y24": y24, "yext": yext, "teams": teams}
+
+    def repair(ind):
+        ind["sep_idx"] = [int(np.clip(v, 0, len(separations) - 1)) for v in ind["sep_idx"]]
+        ind["teams"] = int(np.clip(ind["teams"], 1, max_teams))
+        ind["y24"] = max(int(ind["y24"]), int(min_24h))
+        ind["yext"] = max(int(ind["yext"]), int(min_extended))
+        fixed_m = []
+        for c, idx, mv in zip(circles, ind["sep_idx"], ind["m"]):
+            sep = separations[idx]
+            std = points_from_perimeter(perimeter[c], sep)
+            mn = min_m_for(c, sep)
+            fixed_m.append(int(np.clip(mv, mn, max(mn, std))))
+        ind["m"] = fixed_m
+        return ind
+
+    def evaluate(ind):
+        ind = repair(ind.copy())
+        sep_sel = {c: separations[idx] for c, idx in zip(circles, ind["sep_idx"])}
+        m_sel = {c: mv for c, mv in zip(circles, ind["m"])}
+        lab_samples = {k: int(min_lab_samples[k]) for k in lab_types}
+        strategy_df, lab_df, metrics = compute_plan_metrics(
+            circles_df, sep_sel, m_sel, lab_samples, ind["y24"], ind["yext"], ind["teams"],
+            hours_per_day, daily_cost, t_standard, t_multilevel, t_24h, t_extended,
+            w_standard, w_multilevel, w_24h, w_extended, w_lab, lab_costs,
+        )
+        penalty = 0.0
+        if metrics["Horas de trabajo"] > max_hours:
+            penalty += 1000.0 * (metrics["Horas de trabajo"] - max_hours)
+        if metrics["Costo total"] > budget:
+            penalty += 0.00001 * (metrics["Costo total"] - budget)
+        # Penalización leve por días calendario excesivos respecto al horizonte disponible.
+        if metrics["Días calendario estimados"] > total_days:
+            penalty += 100.0 * (metrics["Días calendario estimados"] - total_days)
+        return metrics["Calidad científica"] - penalty, strategy_df, lab_df, metrics
+
+    def crossover(a, b):
+        cut = int(rng.integers(1, max(2, len(circles))))
+        child = {
+            "sep_idx": a["sep_idx"][:cut] + b["sep_idx"][cut:],
+            "m": a["m"][:cut] + b["m"][cut:],
+            "y24": a["y24"] if rng.random() < 0.5 else b["y24"],
+            "yext": a["yext"] if rng.random() < 0.5 else b["yext"],
+            "teams": a["teams"] if rng.random() < 0.5 else b["teams"],
+        }
+        return repair(child)
+
+    def mutate(ind):
+        ind = ind.copy()
+        ind["sep_idx"] = list(ind["sep_idx"])
+        ind["m"] = list(ind["m"])
+        for j in range(len(circles)):
+            if rng.random() < mutation_rate:
+                ind["sep_idx"][j] = int(rng.integers(0, len(separations)))
+            if rng.random() < mutation_rate:
+                ind["m"][j] += int(rng.integers(-2, 3))
+        if rng.random() < mutation_rate:
+            ind["y24"] += int(rng.integers(-2, 3))
+        if rng.random() < mutation_rate:
+            ind["yext"] += int(rng.integers(-1, 2))
+        if rng.random() < mutation_rate:
+            ind["teams"] += int(rng.integers(-1, 2))
+        return repair(ind)
+
+    population = [random_individual() for _ in range(population_size)]
+    best = None
+    best_score = -1e30
+
+    for _ in range(generations):
+        scored = []
+        for ind in population:
+            score, _, _, _ = evaluate(ind)
+            scored.append((score, ind))
+            if score > best_score:
+                best_score = score
+                best = ind
+        scored.sort(key=lambda x: x[0], reverse=True)
+        elites = [ind for _, ind in scored[: max(2, population_size // 5)]]
+        new_pop = elites.copy()
+        while len(new_pop) < population_size:
+            parents_idx = rng.choice(len(elites), size=2, replace=True)
+            child = crossover(elites[int(parents_idx[0])], elites[int(parents_idx[1])])
+            child = mutate(child)
+            new_pop.append(child)
+        population = new_pop
+
+    score, strategy_df, lab_df, metrics = evaluate(best)
+    feasible = metrics["Horas de trabajo"] <= max_hours and metrics["Costo total"] <= budget and metrics["Días calendario estimados"] <= total_days
+    metrics["Fitness genético"] = float(score)
+    metrics["Margen presupuesto"] = budget - metrics["Costo total"]
+    status = "Heurística factible" if feasible else "Heurística no factible"
+    return status, strategy_df, lab_df, metrics
+
+
 def to_excel(strategy_df: pd.DataFrame, lab_df: pd.DataFrame, metrics: Dict[str, float], params_table: pd.DataFrame) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
@@ -441,6 +700,37 @@ def to_excel(strategy_df: pd.DataFrame, lab_df: pd.DataFrame, metrics: Dict[str,
 
     return output.getvalue()
 
+
+
+def render_solution(title: str, status: str, strategy_df: pd.DataFrame, lab_df: pd.DataFrame, metrics: Dict[str, float], params_table: pd.DataFrame):
+    st.markdown(f"## {title}")
+    if status not in ["Optimal", "Feasible", "Heurística factible"]:
+        st.error(f"No se encontró solución factible. Estado: {status}")
+        st.info("Prueba aumentar presupuesto/tiempo, reducir mínimos, usar separaciones mayores o permitir más equipos.")
+        return
+
+    st.success(f"Solución encontrada: {status}")
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    kpi1.metric("Calidad científica", f"{metrics['Calidad científica']:.4f}")
+    kpi2.metric("Costo total", f"${metrics['Costo total']:,.0f}")
+    kpi3.metric("Margen presupuesto", f"${metrics.get('Margen presupuesto', 0):,.0f}")
+    kpi4.metric("Días calendario estimados", f"{metrics['Días calendario estimados']:.1f}")
+
+    st.markdown("### Estrategia")
+    st.dataframe(strategy_df, use_container_width=True, hide_index=True)
+    st.markdown("### Laboratorio")
+    st.dataframe(lab_df, use_container_width=True, hide_index=True)
+    st.markdown("### Resumen")
+    st.json(metrics)
+
+    excel_bytes = to_excel(strategy_df, lab_df, metrics, params_table)
+    st.download_button(
+        f"Descargar resultados en Excel — {title}",
+        data=excel_bytes,
+        file_name=f"resultados_{title.lower().replace(' ', '_')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
 # -----------------------------
 # Interfaz Streamlit
@@ -477,6 +767,29 @@ with st.sidebar:
 
     st.header("2. Separaciones permitidas")
     sep_text = st.text_input("Separaciones en metros", value=", ".join(map(str, DEFAULT_SEPARATIONS)))
+
+    st.header("3. Modelo de optimización")
+    model_choice = st.selectbox(
+        "Selecciona el modelo",
+        [
+            "MILP actual",
+            "MILP mejorado",
+            "Algoritmo genético",
+            "Comparar MILP mejorado vs genético",
+        ],
+    )
+    multilevel_rule = st.selectbox(
+        "Regla para puntos multinivel",
+        ["Fijo por círculo", "Según perímetro", "Porcentaje de puntos estándar"],
+        index=1,
+    )
+    multilevel_pct = st.number_input(
+        "Porcentaje multinivel sobre puntos estándar",
+        min_value=0.0, max_value=1.0, value=0.10, step=0.01,
+        help="Solo se usa si eliges la regla porcentual.",
+    )
+    ga_generations = st.number_input("Generaciones algoritmo genético", min_value=20, max_value=500, value=120, step=20)
+    ga_population = st.number_input("Población algoritmo genético", min_value=20, max_value=300, value=80, step=20)
 
 # Cargar parámetros desde Excel, si existe.
 params = DEFAULT_PARAMS.copy()
@@ -639,7 +952,7 @@ if run:
     if circles_df.empty or not separations or not lab_types:
         st.error("Revisa que existan círculos, separaciones y tipos de análisis.")
     else:
-        status, strategy_df, lab_df, metrics = solve_model(
+        common_kwargs = dict(
             circles_df=circles_df,
             separations=separations,
             lab_types=lab_types,
@@ -664,34 +977,76 @@ if run:
             lab_costs=lab_costs,
         )
 
-        if status not in ["Optimal", "Feasible"]:
-            st.error(f"El modelo no encontró solución factible. Estado: {status}")
-            st.info("Prueba aumentar presupuesto/tiempo, reducir mínimos o permitir más equipos.")
-        else:
-            st.success(f"Solución encontrada: {status}")
-
-            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-            kpi1.metric("Calidad científica", f"{metrics['Calidad científica']:.4f}")
-            kpi2.metric("Costo total", f"${metrics['Costo total']:,.0f}")
-            kpi3.metric("Margen presupuesto", f"${metrics['Margen presupuesto']:,.0f}")
-            kpi4.metric("Días calendario estimados", f"{metrics['Días calendario estimados']:.1f}")
-
-            st.markdown("### Estrategia óptima")
-            st.dataframe(strategy_df, use_container_width=True)
-
-            st.markdown("### Laboratorio")
-            st.dataframe(lab_df, use_container_width=True)
-
-            st.markdown("### Resumen")
-            st.json(metrics)
-
-            excel_bytes = to_excel(strategy_df, lab_df, metrics, params_table)
-            st.download_button(
-                "Descargar resultados en Excel",
-                data=excel_bytes,
-                file_name="resultados_optimizacion_streamlit.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
+        if model_choice == "MILP actual":
+            status, strategy_df, lab_df, metrics = solve_model(
+                **common_kwargs,
+                model_variant="MILP actual",
+                multilevel_rule="Fijo por círculo",
+                multilevel_pct=float(multilevel_pct),
             )
+            render_solution("MILP actual", status, strategy_df, lab_df, metrics, params_table)
+
+        elif model_choice == "MILP mejorado":
+            status, strategy_df, lab_df, metrics = solve_model(
+                **common_kwargs,
+                model_variant="MILP mejorado",
+                multilevel_rule=multilevel_rule,
+                multilevel_pct=float(multilevel_pct),
+            )
+            render_solution("MILP mejorado", status, strategy_df, lab_df, metrics, params_table)
+
+        elif model_choice == "Algoritmo genético":
+            status, strategy_df, lab_df, metrics = solve_genetic(
+                **common_kwargs,
+                generations=int(ga_generations),
+                population_size=int(ga_population),
+                multilevel_rule=multilevel_rule,
+                multilevel_pct=float(multilevel_pct),
+            )
+            render_solution("Algoritmo genético", status, strategy_df, lab_df, metrics, params_table)
+
+        else:
+            status_m, strategy_m, lab_m, metrics_m = solve_model(
+                **common_kwargs,
+                model_variant="MILP mejorado",
+                multilevel_rule=multilevel_rule,
+                multilevel_pct=float(multilevel_pct),
+            )
+            status_g, strategy_g, lab_g, metrics_g = solve_genetic(
+                **common_kwargs,
+                generations=int(ga_generations),
+                population_size=int(ga_population),
+                multilevel_rule=multilevel_rule,
+                multilevel_pct=float(multilevel_pct),
+            )
+
+            comp = pd.DataFrame([
+                {
+                    "Modelo": "MILP mejorado",
+                    "Estado": status_m,
+                    "Calidad científica": metrics_m.get("Calidad científica"),
+                    "Costo total": metrics_m.get("Costo total"),
+                    "Horas de trabajo": metrics_m.get("Horas de trabajo"),
+                    "Días calendario": metrics_m.get("Días calendario estimados"),
+                    "Equipos": metrics_m.get("Equipos"),
+                },
+                {
+                    "Modelo": "Algoritmo genético",
+                    "Estado": status_g,
+                    "Calidad científica": metrics_g.get("Calidad científica"),
+                    "Costo total": metrics_g.get("Costo total"),
+                    "Horas de trabajo": metrics_g.get("Horas de trabajo"),
+                    "Días calendario": metrics_g.get("Días calendario estimados"),
+                    "Equipos": metrics_g.get("Equipos"),
+                },
+            ])
+            st.markdown("## Comparación de modelos")
+            st.dataframe(comp, use_container_width=True, hide_index=True)
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                render_solution("MILP mejorado", status_m, strategy_m, lab_m, metrics_m, params_table)
+            with col_b:
+                render_solution("Algoritmo genético", status_g, strategy_g, lab_g, metrics_g, params_table)
 else:
     st.info("Carga los archivos, ajusta los parámetros si lo necesitas y presiona **Resolver modelo**.")
