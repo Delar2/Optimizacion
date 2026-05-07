@@ -43,6 +43,13 @@ DEFAULT_PARAMS = {
     "w_multilevel": 0.2029,
     "w_24h": 0.1459,
     "w_extended": 0.0523,
+    # Parámetros fijos de optimización que también pueden venir desde Excel.
+    "model_choice": "Comparar MILP mejorado vs genético",
+    "multilevel_rule": "Según perímetro",
+    "multilevel_pct": 0.10,
+    "ga_generations": 120,
+    "ga_population": 80,
+    "separations_text": ", ".join(map(str, DEFAULT_SEPARATIONS)),
 }
 
 DEFAULT_LAB_CONFIG = pd.DataFrame(
@@ -202,6 +209,21 @@ def read_strategy_parameters_excel(uploaded_file) -> Tuple[Dict[str, float], pd.
                     return val
         return default
 
+    def row_text(contains_all: List[str], contains_any: List[str] = None, exclude: List[str] = None, default=None):
+        contains_any = contains_any or []
+        exclude = exclude or []
+        for _, rr in params_table.iterrows():
+            key = rr["Clave normalizada"]
+            if all(token in key for token in contains_all):
+                if contains_any and not any(token in key for token in contains_any):
+                    continue
+                if any(token in key for token in exclude):
+                    continue
+                value = rr["Valor"]
+                if value is not None and not (isinstance(value, float) and np.isnan(value)):
+                    return str(value).strip()
+        return default
+
     # Tiempo
     params["total_days"] = row_value(["tiempo", "total", "disponible"], default=params["total_days"])
     params["hours_per_day"] = row_value(["horas", "efectivas"], default=params["hours_per_day"])
@@ -246,6 +268,35 @@ def read_strategy_parameters_excel(uploaded_file) -> Tuple[Dict[str, float], pd.
         lab_df.at[i, "Costo unitario"] = float(cost)
         lab_df.at[i, "Mínimo de muestras"] = int(minimum)
         lab_df.at[i, "Peso calidad"] = float(weight)
+
+    # Parámetros de configuración del optimizador.
+    model_text = row_text(["modelo", "optimizacion"], default=params["model_choice"])
+    model_key = normalize_text(model_text)
+    if "actual" in model_key:
+        params["model_choice"] = "MILP actual"
+    elif "genetico" in model_key and "compar" in model_key:
+        params["model_choice"] = "Comparar MILP mejorado vs genético"
+    elif "genetico" in model_key:
+        params["model_choice"] = "Algoritmo genético"
+    elif "mejorado" in model_key:
+        params["model_choice"] = "MILP mejorado"
+
+    rule_text = row_text(["regla", "multinivel"], default=params["multilevel_rule"])
+    rule_key = normalize_text(rule_text)
+    if "perimetro" in rule_key:
+        params["multilevel_rule"] = "Según perímetro"
+    elif "porcentaje" in rule_key or "estandar" in rule_key:
+        params["multilevel_rule"] = "Porcentaje de puntos estándar"
+    elif "fijo" in rule_key or "circulo" in rule_key:
+        params["multilevel_rule"] = "Fijo por círculo"
+
+    params["multilevel_pct"] = row_value(["porcentaje", "multinivel"], default=params["multilevel_pct"])
+    params["ga_generations"] = int(row_value(["generaciones", "genetico"], default=params["ga_generations"]))
+    params["ga_population"] = int(row_value(["poblacion", "genetico"], default=params["ga_population"]))
+
+    sep_text = row_text(["separaciones"], contains_any=["permitidas", "puntos"], default=params["separations_text"])
+    if sep_text:
+        params["separations_text"] = sep_text
 
     expected = [
         "total_days", "hours_per_day", "t_standard", "t_multilevel", "t_24h", "t_extended",
@@ -740,6 +791,14 @@ st.caption(
     "Modelo de programación lineal entera mixta para maximizar calidad científica bajo restricciones de tiempo, presupuesto y mínimos técnicos."
 )
 
+# Valores base. Se actualizan inmediatamente si el usuario sube el Excel de parámetros,
+# para que también puedan controlar el método, la regla multinivel, las separaciones y el algoritmo genético.
+params = DEFAULT_PARAMS.copy()
+lab_config_base = DEFAULT_LAB_CONFIG.copy()
+params_table = pd.DataFrame()
+param_warnings = []
+param_source = "Valores por defecto"
+
 with st.sidebar:
     st.header("1. Archivos de entrada")
 
@@ -748,6 +807,14 @@ with st.sidebar:
         type=["xlsx", "xls"],
         help="Formato esperado: columna A = parámetro, columna B = unidad, columna C = valor.",
     )
+
+    if uploaded_params_file is not None:
+        try:
+            params, params_table, lab_config_base, param_warnings = read_strategy_parameters_excel(uploaded_params_file)
+            param_source = "Excel de parámetros subido"
+        except Exception as exc:
+            st.error(f"No pude leer el Excel de parámetros: {exc}")
+            st.info("Usa el formato: columna A = parámetro, columna B = unidad, columna C = valor.")
 
     uploaded_circles_file = st.file_uploader(
         "Subir Excel con círculos de hadas",
@@ -766,45 +833,52 @@ with st.sidebar:
     allow_edit_circles = st.checkbox("Permitir editar la tabla de círculos", value=False)
 
     st.header("2. Separaciones permitidas")
-    sep_text = st.text_input("Separaciones en metros", value=", ".join(map(str, DEFAULT_SEPARATIONS)))
+    sep_text = st.text_input("Separaciones en metros", value=str(params.get("separations_text", ", ".join(map(str, DEFAULT_SEPARATIONS)))))
 
     st.header("3. Modelo de optimización")
+    model_options = [
+        "MILP actual",
+        "MILP mejorado",
+        "Algoritmo genético",
+        "Comparar MILP mejorado vs genético",
+    ]
+    default_model = params.get("model_choice", "Comparar MILP mejorado vs genético")
     model_choice = st.selectbox(
         "Selecciona el modelo",
-        [
-            "MILP actual",
-            "MILP mejorado",
-            "Algoritmo genético",
-            "Comparar MILP mejorado vs genético",
-        ],
+        model_options,
+        index=model_options.index(default_model) if default_model in model_options else 3,
     )
+
+    rule_options = ["Fijo por círculo", "Según perímetro", "Porcentaje de puntos estándar"]
+    default_rule = params.get("multilevel_rule", "Según perímetro")
     multilevel_rule = st.selectbox(
         "Regla para puntos multinivel",
-        ["Fijo por círculo", "Según perímetro", "Porcentaje de puntos estándar"],
-        index=1,
+        rule_options,
+        index=rule_options.index(default_rule) if default_rule in rule_options else 1,
     )
+
     multilevel_pct = st.number_input(
         "Porcentaje multinivel sobre puntos estándar",
-        min_value=0.0, max_value=1.0, value=0.10, step=0.01,
-        help="Solo se usa si eliges la regla porcentual.",
+        min_value=0.0,
+        max_value=1.0,
+        value=float(params.get("multilevel_pct", 0.10)),
+        step=0.01,
+        help="Solo se usa si eliges la regla porcentual. También puede venir desde el Excel de parámetros.",
     )
-    ga_generations = st.number_input("Generaciones algoritmo genético", min_value=20, max_value=500, value=120, step=20)
-    ga_population = st.number_input("Población algoritmo genético", min_value=20, max_value=300, value=80, step=20)
-
-# Cargar parámetros desde Excel, si existe.
-params = DEFAULT_PARAMS.copy()
-lab_config_base = DEFAULT_LAB_CONFIG.copy()
-params_table = pd.DataFrame()
-param_warnings = []
-param_source = "Valores por defecto"
-
-if uploaded_params_file is not None:
-    try:
-        params, params_table, lab_config_base, param_warnings = read_strategy_parameters_excel(uploaded_params_file)
-        param_source = "Excel de parámetros subido"
-    except Exception as exc:
-        st.error(f"No pude leer el Excel de parámetros: {exc}")
-        st.info("Usa el formato: columna A = parámetro, columna B = unidad, columna C = valor.")
+    ga_generations = st.number_input(
+        "Generaciones algoritmo genético",
+        min_value=20,
+        max_value=500,
+        value=int(params.get("ga_generations", 120)),
+        step=20,
+    )
+    ga_population = st.number_input(
+        "Población algoritmo genético",
+        min_value=20,
+        max_value=300,
+        value=int(params.get("ga_population", 80)),
+        step=20,
+    )
 
 st.subheader("A. Parámetros de estrategia")
 
