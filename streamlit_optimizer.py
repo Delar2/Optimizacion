@@ -42,6 +42,48 @@ def load_example_data() -> pd.DataFrame:
         )
 
 
+def normalize_circles_excel(uploaded_file) -> pd.DataFrame:
+    """Lee un Excel con columnas tipo ID y Perimetro (m), normaliza nombres y valida datos."""
+    raw = pd.read_excel(uploaded_file)
+    raw.columns = [str(c).strip() for c in raw.columns]
+
+    # Posibles nombres de columnas en español/inglés y con/sin acentos.
+    id_candidates = [
+        "ID", "Id", "id", "Círculo", "Circulo", "circulo", "CIRCLE", "Circle", "circle"
+    ]
+    perimeter_candidates = [
+        "Perímetro (m)", "Perimetro (m)", "PERIMETRO (m)", "Perímetro", "Perimetro",
+        "perimetro", "perímetro", "Perimeter (m)", "Perimeter", "perimeter"
+    ]
+
+    id_col = next((c for c in id_candidates if c in raw.columns), None)
+    perimeter_col = next((c for c in perimeter_candidates if c in raw.columns), None)
+
+    # Fallback para archivos con exactamente el formato visual: primera columna ID, segunda perímetro.
+    if id_col is None and len(raw.columns) >= 1:
+        id_col = raw.columns[0]
+    if perimeter_col is None and len(raw.columns) >= 2:
+        perimeter_col = raw.columns[1]
+
+    if id_col is None or perimeter_col is None:
+        raise ValueError("El Excel debe tener una columna de ID y una columna de perímetro en metros.")
+
+    df = raw[[id_col, perimeter_col]].copy()
+    df.columns = ["Círculo", "Perímetro (m)"]
+    df["Círculo"] = df["Círculo"].astype(str).str.strip()
+    df["Perímetro (m)"] = (
+        df["Perímetro (m)"]
+        .astype(str)
+        .str.replace(",", ".", regex=False)
+        .str.strip()
+    )
+    df["Perímetro (m)"] = pd.to_numeric(df["Perímetro (m)"], errors="coerce")
+    df = df.dropna(subset=["Círculo", "Perímetro (m)"])
+    df = df[df["Perímetro (m)"] > 0]
+    df = df.drop_duplicates(subset=["Círculo"], keep="first")
+    return df.reset_index(drop=True)
+
+
 def points_from_perimeter(perimeter: float, separation: float) -> int:
     """Número de puntos estándar calculado como ceil(perímetro/separación), mínimo 1."""
     if separation <= 0:
@@ -222,8 +264,20 @@ st.caption("Modelo de programación lineal entera mixta para maximizar calidad c
 
 with st.sidebar:
     st.header("1. Datos generales")
-    use_example = st.checkbox("Usar perímetros del Excel de ejemplo", value=True)
-    n_circles = st.number_input("Número de círculos", min_value=1, max_value=200, value=30, step=1)
+    uploaded_circles_file = st.file_uploader(
+        "Subir Excel con círculos de hadas",
+        type=["xlsx", "xls"],
+        help="Formato esperado: columna ID y columna Perimetro (m). También acepta Perímetro (m).",
+    )
+    use_example = st.checkbox("Usar Excel de ejemplo si no subo archivo", value=True)
+    n_circles = st.number_input(
+        "Número de círculos para modo manual/ejemplo",
+        min_value=1,
+        max_value=500,
+        value=30,
+        step=1,
+    )
+    allow_edit_circles = st.checkbox("Permitir editar la tabla de círculos", value=False)
 
     st.header("2. Separaciones permitidas")
     sep_text = st.text_input("Separaciones en metros", value=", ".join(map(str, DEFAULT_SEPARATIONS)))
@@ -248,25 +302,52 @@ with st.sidebar:
 
 st.subheader("A. Geometría de los círculos")
 
-if use_example:
+uploaded_error = None
+if uploaded_circles_file is not None:
+    try:
+        base_df = normalize_circles_excel(uploaded_circles_file)
+        data_source = "Archivo subido por el usuario"
+    except Exception as exc:
+        uploaded_error = str(exc)
+        base_df = pd.DataFrame({"Círculo": [], "Perímetro (m)": []})
+        data_source = "Archivo no válido"
+elif use_example:
     base_df = load_example_data().head(int(n_circles)).copy()
     if len(base_df) < n_circles:
+        mean_perimeter = float(base_df["Perímetro (m)"].mean()) if not base_df.empty else 100.0
         extra = pd.DataFrame(
             {
                 "Círculo": [f"C{i}" for i in range(len(base_df) + 1, int(n_circles) + 1)],
-                "Perímetro (m)": np.repeat(float(base_df["Perímetro (m)"].mean()), int(n_circles) - len(base_df)),
+                "Perímetro (m)": np.repeat(mean_perimeter, int(n_circles) - len(base_df)),
             }
         )
         base_df = pd.concat([base_df, extra], ignore_index=True)
+    data_source = "Excel de ejemplo"
 else:
-    base_df = pd.DataFrame({"Círculo": [f"C{i}" for i in range(1, int(n_circles) + 1)], "Perímetro (m)": [100.0] * int(n_circles)})
+    base_df = pd.DataFrame(
+        {"Círculo": [f"C{i}" for i in range(1, int(n_circles) + 1)], "Perímetro (m)": [100.0] * int(n_circles)}
+    )
+    data_source = "Tabla manual"
 
-circles_df = st.data_editor(
-    base_df,
-    num_rows="dynamic",
-    use_container_width=True,
-    column_config={"Perímetro (m)": st.column_config.NumberColumn(min_value=1.0, step=1.0)},
-)
+if uploaded_error:
+    st.error(f"No pude leer el Excel: {uploaded_error}")
+    st.info("Usa un archivo con dos columnas: ID y Perimetro (m). Ejemplo: C1 | 113")
+
+metric_col1, metric_col2, metric_col3 = st.columns(3)
+metric_col1.metric("Número de círculos de hadas", len(base_df))
+metric_col2.metric("Perímetro total (m)", f"{base_df['Perímetro (m)'].sum():,.1f}" if not base_df.empty else "0")
+metric_col3.metric("Fuente de datos", data_source)
+
+if allow_edit_circles:
+    circles_df = st.data_editor(
+        base_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={"Perímetro (m)": st.column_config.NumberColumn(min_value=1.0, step=1.0)},
+    )
+else:
+    circles_df = base_df.copy()
+    st.dataframe(circles_df, use_container_width=True, hide_index=True)
 
 st.subheader("B. Análisis de laboratorio")
 lab_config = pd.DataFrame(
