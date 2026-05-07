@@ -1,5 +1,7 @@
 import io
 import math
+import re
+import unicodedata
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -24,6 +26,69 @@ DEFAULT_LAB_TYPES = [
     "Helio",
 ]
 
+DEFAULT_PARAMS = {
+    "total_days": 60.0,
+    "hours_per_day": 8.0,
+    "t_standard": 1.0,
+    "t_multilevel": 3.0,
+    "t_24h": 25.0,
+    "t_extended": 121.0,
+    "budget": 400_000_000.0,
+    "daily_cost": 1_350_000.0,
+    "min_multilevel_per_circle": 3,
+    "min_24h": 10,
+    "min_extended": 2,
+    "max_teams": 4,
+    "w_standard": 0.2417,
+    "w_multilevel": 0.2029,
+    "w_24h": 0.1459,
+    "w_extended": 0.0523,
+}
+
+DEFAULT_LAB_CONFIG = pd.DataFrame(
+    {
+        "Tipo de análisis": DEFAULT_LAB_TYPES,
+        "Mínimo de muestras": [15, 15, 15, 5, 5],
+        "Costo unitario": [309_200, 3_100_000, 1_069_200, 792_000, 3_240_000],
+        "Peso calidad": [0.0399, 0.0328, 0.1511, 0.0897, 0.0438],
+    }
+)
+
+
+# -----------------------------
+# Lectura y normalización
+# -----------------------------
+
+def normalize_text(value) -> str:
+    """Normaliza texto para comparar etiquetas con/sin acentos."""
+    text = "" if value is None else str(value)
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.lower().strip()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def clean_number(value, default=None):
+    """Convierte números desde Excel aceptando coma o punto decimal."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return default
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return default
+    text = text.replace("$", "").replace("COP", "").replace(" ", "")
+    # Si hay punto de miles y coma decimal: 1.234,56 -> 1234.56
+    if "," in text and "." in text and text.rfind(",") > text.rfind("."):
+        text = text.replace(".", "").replace(",", ".")
+    else:
+        text = text.replace(",", ".")
+    try:
+        return float(text)
+    except ValueError:
+        return default
+
 
 @st.cache_data
 def load_example_data() -> pd.DataFrame:
@@ -47,7 +112,6 @@ def normalize_circles_excel(uploaded_file) -> pd.DataFrame:
     raw = pd.read_excel(uploaded_file)
     raw.columns = [str(c).strip() for c in raw.columns]
 
-    # Posibles nombres de columnas en español/inglés y con/sin acentos.
     id_candidates = [
         "ID", "Id", "id", "Círculo", "Circulo", "circulo", "CIRCLE", "Circle", "circle"
     ]
@@ -59,7 +123,6 @@ def normalize_circles_excel(uploaded_file) -> pd.DataFrame:
     id_col = next((c for c in id_candidates if c in raw.columns), None)
     perimeter_col = next((c for c in perimeter_candidates if c in raw.columns), None)
 
-    # Fallback para archivos con exactamente el formato visual: primera columna ID, segunda perímetro.
     if id_col is None and len(raw.columns) >= 1:
         id_col = raw.columns[0]
     if perimeter_col is None and len(raw.columns) >= 2:
@@ -71,21 +134,136 @@ def normalize_circles_excel(uploaded_file) -> pd.DataFrame:
     df = raw[[id_col, perimeter_col]].copy()
     df.columns = ["Círculo", "Perímetro (m)"]
     df["Círculo"] = df["Círculo"].astype(str).str.strip()
-    df["Perímetro (m)"] = (
-        df["Perímetro (m)"]
-        .astype(str)
-        .str.replace(",", ".", regex=False)
-        .str.strip()
-    )
-    df["Perímetro (m)"] = pd.to_numeric(df["Perímetro (m)"], errors="coerce")
+    df["Perímetro (m)"] = df["Perímetro (m)"].map(lambda v: clean_number(v, np.nan))
     df = df.dropna(subset=["Círculo", "Perímetro (m)"])
     df = df[df["Perímetro (m)"] > 0]
     df = df.drop_duplicates(subset=["Círculo"], keep="first")
     return df.reset_index(drop=True)
 
 
+def read_strategy_parameters_excel(uploaded_file) -> Tuple[Dict[str, float], pd.DataFrame, pd.DataFrame, List[str]]:
+    """
+    Lee el Excel de parámetros con formato:
+    Columna A = parámetro/sección, Columna B = unidad, Columna C = valor.
+    Devuelve parámetros generales, tabla normalizada, configuración de laboratorio y advertencias.
+    """
+    raw = pd.read_excel(uploaded_file, sheet_name=0, header=None)
+    rows = []
+    current_section = ""
+    warnings = []
+
+    for _, r in raw.iterrows():
+        name = r.iloc[0] if len(r) > 0 else None
+        unit = r.iloc[1] if len(r) > 1 else None
+        value = r.iloc[2] if len(r) > 2 else None
+        n_name = normalize_text(name)
+        n_unit = normalize_text(unit)
+        n_value = normalize_text(value)
+
+        if not n_name:
+            continue
+
+        # Filas de sección: tienen cabecera tipo "PARAMETROS DE TIEMPO | Unidad | Valor".
+        if n_unit == "unidad" and n_value == "valor":
+            current_section = str(name).strip()
+            continue
+
+        # Título superior del archivo.
+        if "modelo estrategico" in n_name and value is None:
+            continue
+
+        rows.append(
+            {
+                "Sección": current_section,
+                "Parámetro": str(name).strip(),
+                "Unidad": "" if unit is None else str(unit).strip(),
+                "Valor": value,
+                "Valor numérico": clean_number(value, np.nan),
+                "Clave normalizada": n_name,
+            }
+        )
+
+    params_table = pd.DataFrame(rows)
+    params = DEFAULT_PARAMS.copy()
+    lab_df = DEFAULT_LAB_CONFIG.copy()
+
+    def row_value(contains_all: List[str], contains_any: List[str] = None, exclude: List[str] = None, default=None):
+        contains_any = contains_any or []
+        exclude = exclude or []
+        for _, rr in params_table.iterrows():
+            key = rr["Clave normalizada"]
+            if all(token in key for token in contains_all):
+                if contains_any and not any(token in key for token in contains_any):
+                    continue
+                if any(token in key for token in exclude):
+                    continue
+                val = clean_number(rr["Valor"], default)
+                if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                    return val
+        return default
+
+    # Tiempo
+    params["total_days"] = row_value(["tiempo", "total", "disponible"], default=params["total_days"])
+    params["hours_per_day"] = row_value(["horas", "efectivas"], default=params["hours_per_day"])
+    params["t_standard"] = row_value(["muestreo", "puntual", "estandar"], default=params["t_standard"])
+    params["t_multilevel"] = row_value(["muestreo", "multinivel"], default=params["t_multilevel"])
+    params["t_24h"] = row_value(["medicion", "24"], default=params["t_24h"])
+    params["t_extended"] = row_value(["medicion", "extendida"], default=params["t_extended"])
+
+    # Costos
+    params["budget"] = row_value(["presupuesto", "total"], default=params["budget"])
+    params["daily_cost"] = row_value(["costo", "diario", "muestreo"], default=params["daily_cost"])
+
+    # Mínimos y equipos
+    params["min_multilevel_per_circle"] = int(row_value(["puntos", "multinivel", "minimos"], default=params["min_multilevel_per_circle"]))
+    params["min_24h"] = int(row_value(["mediciones", "24", "minimas"], default=params["min_24h"]))
+    params["min_extended"] = int(row_value(["mediciones", "extendidas", "minimas"], default=params["min_extended"]))
+    params["max_teams"] = int(row_value(["equipos", "sensores", "disponibles"], default=params["max_teams"]))
+
+    # Pesos principales
+    params["w_standard"] = row_value(["calidad", "punto", "estandar"], default=params["w_standard"])
+    params["w_multilevel"] = row_value(["calidad", "punto", "multinivel"], default=params["w_multilevel"])
+    params["w_24h"] = row_value(["calidad", "medicion", "24"], default=params["w_24h"])
+    params["w_extended"] = row_value(["calidad", "medicion", "extendida"], default=params["w_extended"])
+
+    lab_mapping = {
+        "Cromatografía": ["cromatografia"],
+        "Deuterio": ["deuterio"],
+        "Helio": ["helio"],
+        "Mineralógico": ["mineralogica"],
+        "Biogeoquímico": ["biogeoquimica"],
+    }
+
+    for lab_name, tokens in lab_mapping.items():
+        idx = lab_df.index[lab_df["Tipo de análisis"] == lab_name]
+        if len(idx) == 0:
+            continue
+        i = idx[0]
+        token = tokens[0]
+        cost = row_value(["costo", "unitario", token], default=lab_df.at[i, "Costo unitario"])
+        minimum = row_value(["muestras", "minimas", token], default=lab_df.at[i, "Mínimo de muestras"])
+        weight = row_value(["calidad", token], default=lab_df.at[i, "Peso calidad"])
+        lab_df.at[i, "Costo unitario"] = float(cost)
+        lab_df.at[i, "Mínimo de muestras"] = int(minimum)
+        lab_df.at[i, "Peso calidad"] = float(weight)
+
+    expected = [
+        "total_days", "hours_per_day", "t_standard", "t_multilevel", "t_24h", "t_extended",
+        "budget", "daily_cost", "min_multilevel_per_circle", "min_24h", "min_extended",
+        "max_teams", "w_standard", "w_multilevel", "w_24h", "w_extended"
+    ]
+    missing = [k for k in expected if params.get(k) is None]
+    if missing:
+        warnings.append("Algunos parámetros no fueron reconocidos y se usaron valores por defecto: " + ", ".join(missing))
+
+    return params, params_table.drop(columns=["Clave normalizada"]), lab_df, warnings
+
+
+# -----------------------------
+# Modelo MILP
+# -----------------------------
+
 def points_from_perimeter(perimeter: float, separation: float) -> int:
-    """Número de puntos estándar calculado como ceil(perímetro/separación), mínimo 1."""
     if separation <= 0:
         return 1
     return max(1, int(math.ceil(perimeter / separation)))
@@ -95,7 +273,7 @@ def solve_model(
     circles_df: pd.DataFrame,
     separations: List[int],
     lab_types: List[str],
-    total_time_h: float,
+    total_days: float,
     hours_per_day: float,
     budget: float,
     daily_cost: float,
@@ -129,14 +307,13 @@ def solve_model(
     x = pulp.LpVariable.dicts("usar_separacion", (circles, separations), lowBound=0, upBound=1, cat="Binary")
     m = pulp.LpVariable.dicts("puntos_multinivel", circles, lowBound=0, cat="Integer")
     teams = pulp.LpVariable("equipos", lowBound=1, upBound=max_teams, cat="Integer")
-    h_total = pulp.LpVariable("horas_hombre", lowBound=0, cat="Continuous")
+    h_total = pulp.LpVariable("horas_trabajo", lowBound=0, cat="Continuous")
     y_24h = pulp.LpVariable("mediciones_24h", lowBound=0, cat="Integer")
     y_ext = pulp.LpVariable("mediciones_extendidas", lowBound=0, cat="Integer")
     lab = pulp.LpVariable.dicts("muestras_lab", lab_types, lowBound=0, cat="Integer")
 
     standard_points_expr = pulp.lpSum(n_points[(i, s)] * x[i][s] for i in circles for s in separations)
     multilevel_expr = pulp.lpSum(m[i] for i in circles)
-    lab_expr = pulp.lpSum(lab[k] for k in lab_types)
 
     model += (
         w_standard * standard_points_expr
@@ -153,9 +330,10 @@ def solve_model(
         + t_extended * y_ext
     )
     model += h_total == field_hours_expr, "R1_definicion_esfuerzo"
-    model += h_total <= total_time_h * teams, "R2_capacidad_operativa"
+    model += h_total <= total_days * hours_per_day * teams, "R2_capacidad_operativa"
 
-    operation_days_expr = h_total / max(hours_per_day * 2, 1e-6)
+    # Aproximación lineal: costo operativo por día de trabajo efectivo de un equipo.
+    operation_days_expr = h_total / max(hours_per_day, 1e-6)
     operation_cost_expr = operation_days_expr * daily_cost
     lab_cost_expr = pulp.lpSum(lab_costs[k] * lab[k] for k in lab_types)
     model += operation_cost_expr + lab_cost_expr <= budget, "R3_presupuesto"
@@ -212,14 +390,17 @@ def solve_model(
 
     if status in ["Optimal", "Feasible"]:
         total_h = float(pulp.value(h_total))
-        operation_days = total_h / max(hours_per_day * 2, 1e-6)
+        selected_teams = int(round(pulp.value(teams)))
+        operation_days = total_h / max(hours_per_day, 1e-6)
+        calendar_days_est = total_h / max(hours_per_day * selected_teams, 1e-6)
         lab_total = float(sum(lab_df["Costo total"]))
         operation_total = operation_days * daily_cost
         metrics = {
             "Calidad científica": float(pulp.value(model.objective)),
-            "Horas-hombre": total_h,
-            "Días de operación estimados": operation_days,
-            "Equipos": int(round(pulp.value(teams))),
+            "Horas de trabajo": total_h,
+            "Días-equipo operativos": operation_days,
+            "Días calendario estimados": calendar_days_est,
+            "Equipos": selected_teams,
             "Mediciones 24 h": int(round(pulp.value(y_24h))),
             "Mediciones extendidas": int(round(pulp.value(y_ext))),
             "Costo operativo": operation_total,
@@ -233,7 +414,7 @@ def solve_model(
     return status, strategy_df, lab_df, metrics
 
 
-def to_excel(strategy_df: pd.DataFrame, lab_df: pd.DataFrame, metrics: Dict[str, float]) -> bytes:
+def to_excel(strategy_df: pd.DataFrame, lab_df: pd.DataFrame, metrics: Dict[str, float], params_table: pd.DataFrame) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         strategy_df.to_excel(writer, index=False, sheet_name="Estrategia")
@@ -241,35 +422,50 @@ def to_excel(strategy_df: pd.DataFrame, lab_df: pd.DataFrame, metrics: Dict[str,
         pd.DataFrame(list(metrics.items()), columns=["Concepto", "Valor"]).to_excel(
             writer, index=False, sheet_name="Resumen"
         )
+        if not params_table.empty:
+            params_table.to_excel(writer, index=False, sheet_name="Parametros cargados")
 
         workbook = writer.book
         money_fmt = workbook.add_format({"num_format": "$#,##0"})
         num_fmt = workbook.add_format({"num_format": "0.00"})
         header_fmt = workbook.add_format({"bold": True, "bg_color": "#D9EAF7", "border": 1})
 
-        for sheet_name in ["Estrategia", "Laboratorio", "Resumen"]:
+        for sheet_name in writer.sheets:
             ws = writer.sheets[sheet_name]
             ws.set_row(0, None, header_fmt)
-            ws.set_column(0, 0, 18)
-            ws.set_column(1, 10, 18)
+            ws.set_column(0, 0, 24)
+            ws.set_column(1, 10, 20)
 
         writer.sheets["Laboratorio"].set_column(2, 3, 18, money_fmt)
-        writer.sheets["Resumen"].set_column(1, 1, 18, num_fmt)
+        writer.sheets["Resumen"].set_column(1, 1, 20, num_fmt)
 
     return output.getvalue()
 
 
+# -----------------------------
+# Interfaz Streamlit
+# -----------------------------
 st.title("🧪 Optimizador MILP de estrategia de muestreo")
-st.caption("Modelo de programación lineal entera mixta para maximizar calidad científica bajo restricciones de tiempo, presupuesto y mínimos técnicos.")
+st.caption(
+    "Modelo de programación lineal entera mixta para maximizar calidad científica bajo restricciones de tiempo, presupuesto y mínimos técnicos."
+)
 
 with st.sidebar:
-    st.header("1. Datos generales")
+    st.header("1. Archivos de entrada")
+
+    uploaded_params_file = st.file_uploader(
+        "Subir Excel de parámetros de estrategia",
+        type=["xlsx", "xls"],
+        help="Formato esperado: columna A = parámetro, columna B = unidad, columna C = valor.",
+    )
+
     uploaded_circles_file = st.file_uploader(
         "Subir Excel con círculos de hadas",
         type=["xlsx", "xls"],
         help="Formato esperado: columna ID y columna Perimetro (m). También acepta Perímetro (m).",
     )
-    use_example = st.checkbox("Usar Excel de ejemplo si no subo archivo", value=True)
+
+    use_example = st.checkbox("Usar Excel de ejemplo si no subo círculos", value=True)
     n_circles = st.number_input(
         "Número de círculos para modo manual/ejemplo",
         min_value=1,
@@ -282,31 +478,48 @@ with st.sidebar:
     st.header("2. Separaciones permitidas")
     sep_text = st.text_input("Separaciones en metros", value=", ".join(map(str, DEFAULT_SEPARATIONS)))
 
-    st.header("3. Tiempo y equipos")
-    total_time_h = st.number_input("Tiempo total disponible por equipo (h)", min_value=1.0, value=1848.0, step=8.0)
-    hours_per_day = st.number_input("Horas efectivas por día", min_value=1.0, value=8.0, step=1.0)
-    max_teams = st.number_input("Máximo de equipos", min_value=1, max_value=20, value=3, step=1)
-    t_standard = st.number_input("Tiempo por punto estándar (h)", min_value=0.0, value=1.0, step=0.25)
-    t_multilevel = st.number_input("Tiempo por punto multinivel (h)", min_value=0.0, value=2.0, step=0.25)
-    t_24h = st.number_input("Tiempo por medición 24 h (h)", min_value=0.0, value=24.0, step=1.0)
-    t_extended = st.number_input("Tiempo por medición extendida (h)", min_value=0.0, value=48.0, step=1.0)
+# Cargar parámetros desde Excel, si existe.
+params = DEFAULT_PARAMS.copy()
+lab_config_base = DEFAULT_LAB_CONFIG.copy()
+params_table = pd.DataFrame()
+param_warnings = []
+param_source = "Valores por defecto"
 
-    st.header("4. Presupuesto")
-    budget = st.number_input("Presupuesto total", min_value=0.0, value=400_000_000.0, step=1_000_000.0)
-    daily_cost = st.number_input("Costo operativo diario", min_value=0.0, value=1_350_000.0, step=50_000.0)
+if uploaded_params_file is not None:
+    try:
+        params, params_table, lab_config_base, param_warnings = read_strategy_parameters_excel(uploaded_params_file)
+        param_source = "Excel de parámetros subido"
+    except Exception as exc:
+        st.error(f"No pude leer el Excel de parámetros: {exc}")
+        st.info("Usa el formato: columna A = parámetro, columna B = unidad, columna C = valor.")
 
-    st.header("5. Requisitos mínimos")
-    min_multilevel_per_circle = st.number_input("Puntos multinivel mínimos por círculo", min_value=0, value=3, step=1)
-    min_24h = st.number_input("Mediciones 24 h mínimas", min_value=0, value=1, step=1)
-    min_extended = st.number_input("Mediciones extendidas mínimas", min_value=0, value=1, step=1)
+st.subheader("A. Parámetros de estrategia")
 
-st.subheader("A. Geometría de los círculos")
+pcol1, pcol2 = st.columns([1, 3])
+with pcol1:
+    st.metric("Fuente de parámetros", param_source)
+    if not params_table.empty:
+        st.metric("Parámetros leídos", len(params_table))
+with pcol2:
+    if not params_table.empty:
+        st.dataframe(
+            params_table[["Sección", "Parámetro", "Unidad", "Valor"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("Puedes subir el Excel de parámetros o usar los valores por defecto.")
+
+for msg in param_warnings:
+    st.warning(msg)
+
+st.subheader("B. Geometría de los círculos")
 
 uploaded_error = None
 if uploaded_circles_file is not None:
     try:
         base_df = normalize_circles_excel(uploaded_circles_file)
-        data_source = "Archivo subido por el usuario"
+        data_source = "Archivo de círculos subido"
     except Exception as exc:
         uploaded_error = str(exc)
         base_df = pd.DataFrame({"Círculo": [], "Perímetro (m)": []})
@@ -330,13 +543,13 @@ else:
     data_source = "Tabla manual"
 
 if uploaded_error:
-    st.error(f"No pude leer el Excel: {uploaded_error}")
+    st.error(f"No pude leer el Excel de círculos: {uploaded_error}")
     st.info("Usa un archivo con dos columnas: ID y Perimetro (m). Ejemplo: C1 | 113")
 
 metric_col1, metric_col2, metric_col3 = st.columns(3)
 metric_col1.metric("Número de círculos de hadas", len(base_df))
 metric_col2.metric("Perímetro total (m)", f"{base_df['Perímetro (m)'].sum():,.1f}" if not base_df.empty else "0")
-metric_col3.metric("Fuente de datos", data_source)
+metric_col3.metric("Fuente de círculos", data_source)
 
 if allow_edit_circles:
     circles_df = st.data_editor(
@@ -349,36 +562,64 @@ else:
     circles_df = base_df.copy()
     st.dataframe(circles_df, use_container_width=True, hide_index=True)
 
-st.subheader("B. Análisis de laboratorio")
-lab_config = pd.DataFrame(
-    {
-        "Tipo de análisis": DEFAULT_LAB_TYPES,
-        "Mínimo de muestras": [1, 1, 1, 1, 1],
-        "Costo unitario": [250_000, 350_000, 450_000, 500_000, 500_000],
-        "Peso calidad": [0.25, 0.30, 0.25, 0.10, 0.10],
-    }
-)
+st.subheader("C. Tiempo, presupuesto y equipos")
+
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    total_days = st.number_input("Tiempo total disponible (días)", min_value=1.0, value=float(params["total_days"]), step=1.0)
+with c2:
+    hours_per_day = st.number_input("Horas efectivas por día", min_value=1.0, value=float(params["hours_per_day"]), step=1.0)
+with c3:
+    max_teams = st.number_input("Equipos/sensores disponibles", min_value=1, max_value=100, value=int(params["max_teams"]), step=1)
+with c4:
+    budget = st.number_input("Presupuesto total", min_value=0.0, value=float(params["budget"]), step=1_000_000.0)
+
+c5, c6, c7, c8, c9 = st.columns(5)
+with c5:
+    daily_cost = st.number_input("Costo diario de muestreo", min_value=0.0, value=float(params["daily_cost"]), step=50_000.0)
+with c6:
+    t_standard = st.number_input("Tiempo punto estándar (h)", min_value=0.0, value=float(params["t_standard"]), step=0.25)
+with c7:
+    t_multilevel = st.number_input("Tiempo punto multinivel (h)", min_value=0.0, value=float(params["t_multilevel"]), step=0.25)
+with c8:
+    t_24h = st.number_input("Tiempo medición 24 h (h)", min_value=0.0, value=float(params["t_24h"]), step=1.0)
+with c9:
+    t_extended = st.number_input("Tiempo medición extendida (h)", min_value=0.0, value=float(params["t_extended"]), step=1.0)
+
+st.subheader("D. Requisitos mínimos")
+
+r1, r2, r3 = st.columns(3)
+with r1:
+    min_multilevel_per_circle = st.number_input(
+        "Puntos multinivel mínimos por círculo", min_value=0, value=int(params["min_multilevel_per_circle"]), step=1
+    )
+with r2:
+    min_24h = st.number_input("Mediciones 24 h mínimas", min_value=0, value=int(params["min_24h"]), step=1)
+with r3:
+    min_extended = st.number_input("Mediciones extendidas mínimas", min_value=0, value=int(params["min_extended"]), step=1)
+
+st.subheader("E. Análisis de laboratorio")
 lab_config = st.data_editor(
-    lab_config,
+    lab_config_base,
     num_rows="dynamic",
     use_container_width=True,
     column_config={
         "Mínimo de muestras": st.column_config.NumberColumn(min_value=0, step=1),
         "Costo unitario": st.column_config.NumberColumn(min_value=0.0, step=10_000.0),
-        "Peso calidad": st.column_config.NumberColumn(min_value=0.0, max_value=1.0, step=0.05),
+        "Peso calidad": st.column_config.NumberColumn(min_value=0.0, max_value=1.0, step=0.0001, format="%.4f"),
     },
 )
 
-st.subheader("C. Pesos de calidad científica")
+st.subheader("F. Pesos de calidad científica")
 col1, col2, col3, col4 = st.columns(4)
 with col1:
-    w_standard = st.number_input("Peso punto estándar", min_value=0.0, value=1.0, step=0.1)
+    w_standard = st.number_input("Peso punto estándar", min_value=0.0, value=float(params["w_standard"]), step=0.0001, format="%.4f")
 with col2:
-    w_multilevel = st.number_input("Peso punto multinivel", min_value=0.0, value=2.0, step=0.1)
+    w_multilevel = st.number_input("Peso punto multinivel", min_value=0.0, value=float(params["w_multilevel"]), step=0.0001, format="%.4f")
 with col3:
-    w_24h = st.number_input("Peso medición 24 h", min_value=0.0, value=5.0, step=0.5)
+    w_24h = st.number_input("Peso medición 24 h", min_value=0.0, value=float(params["w_24h"]), step=0.0001, format="%.4f")
 with col4:
-    w_extended = st.number_input("Peso medición extendida", min_value=0.0, value=8.0, step=0.5)
+    w_extended = st.number_input("Peso medición extendida", min_value=0.0, value=float(params["w_extended"]), step=0.0001, format="%.4f")
 
 try:
     separations = sorted([int(float(x.strip())) for x in sep_text.split(",") if x.strip()])
@@ -402,23 +643,23 @@ if run:
             circles_df=circles_df,
             separations=separations,
             lab_types=lab_types,
-            total_time_h=total_time_h,
-            hours_per_day=hours_per_day,
-            budget=budget,
-            daily_cost=daily_cost,
-            t_standard=t_standard,
-            t_multilevel=t_multilevel,
-            t_24h=t_24h,
-            t_extended=t_extended,
+            total_days=float(total_days),
+            hours_per_day=float(hours_per_day),
+            budget=float(budget),
+            daily_cost=float(daily_cost),
+            t_standard=float(t_standard),
+            t_multilevel=float(t_multilevel),
+            t_24h=float(t_24h),
+            t_extended=float(t_extended),
             min_multilevel_per_circle=int(min_multilevel_per_circle),
             min_24h=int(min_24h),
             min_extended=int(min_extended),
             min_lab_samples=min_lab_samples,
             max_teams=int(max_teams),
-            w_standard=w_standard,
-            w_multilevel=w_multilevel,
-            w_24h=w_24h,
-            w_extended=w_extended,
+            w_standard=float(w_standard),
+            w_multilevel=float(w_multilevel),
+            w_24h=float(w_24h),
+            w_extended=float(w_extended),
             w_lab=w_lab,
             lab_costs=lab_costs,
         )
@@ -430,10 +671,10 @@ if run:
             st.success(f"Solución encontrada: {status}")
 
             kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-            kpi1.metric("Calidad científica", f"{metrics['Calidad científica']:.2f}")
+            kpi1.metric("Calidad científica", f"{metrics['Calidad científica']:.4f}")
             kpi2.metric("Costo total", f"${metrics['Costo total']:,.0f}")
             kpi3.metric("Margen presupuesto", f"${metrics['Margen presupuesto']:,.0f}")
-            kpi4.metric("Días operación", f"{metrics['Días de operación estimados']:.1f}")
+            kpi4.metric("Días calendario estimados", f"{metrics['Días calendario estimados']:.1f}")
 
             st.markdown("### Estrategia óptima")
             st.dataframe(strategy_df, use_container_width=True)
@@ -444,7 +685,7 @@ if run:
             st.markdown("### Resumen")
             st.json(metrics)
 
-            excel_bytes = to_excel(strategy_df, lab_df, metrics)
+            excel_bytes = to_excel(strategy_df, lab_df, metrics, params_table)
             st.download_button(
                 "Descargar resultados en Excel",
                 data=excel_bytes,
@@ -453,4 +694,4 @@ if run:
                 use_container_width=True,
             )
 else:
-    st.info("Ajusta los parámetros y presiona **Resolver modelo**.")
+    st.info("Carga los archivos, ajusta los parámetros si lo necesitas y presiona **Resolver modelo**.")
