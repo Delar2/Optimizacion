@@ -45,7 +45,8 @@ DEFAULT_PARAMS = {
     "w_extended": 0.0523,
     # Parámetros fijos de optimización que también pueden venir desde Excel.
     "model_choice": "Comparar MILP mejorado vs genético",
-    "multilevel_rule": "Según perímetro",
+    # Los puntos multinivel se manejan como un valor fijo editable: min_multilevel_per_circle.
+    "multilevel_rule": "Fijo por círculo",
     "multilevel_pct": 0.10,
     "ga_generations": 120,
     "ga_population": 80,
@@ -281,15 +282,10 @@ def read_strategy_parameters_excel(uploaded_file) -> Tuple[Dict[str, float], pd.
     elif "mejorado" in model_key:
         params["model_choice"] = "MILP mejorado"
 
-    rule_text = row_text(["regla", "multinivel"], default=params["multilevel_rule"])
-    rule_key = normalize_text(rule_text)
-    if "perimetro" in rule_key:
-        params["multilevel_rule"] = "Según perímetro"
-    elif "porcentaje" in rule_key or "estandar" in rule_key:
-        params["multilevel_rule"] = "Porcentaje de puntos estándar"
-    elif "fijo" in rule_key or "circulo" in rule_key:
-        params["multilevel_rule"] = "Fijo por círculo"
-
+    # Los puntos multinivel se manejan como valor fijo por círculo.
+    # Si el Excel contiene reglas antiguas como "según perímetro" o "porcentaje", se ignoran
+    # para evitar confusión en la interfaz.
+    params["multilevel_rule"] = "Fijo por círculo"
     params["multilevel_pct"] = row_value(["porcentaje", "multinivel"], default=params["multilevel_pct"])
     params["ga_generations"] = int(row_value(["generaciones", "genetico"], default=params["ga_generations"]))
     params["ga_population"] = int(row_value(["poblacion", "genetico"], default=params["ga_population"]))
@@ -849,21 +845,13 @@ with st.sidebar:
         index=model_options.index(default_model) if default_model in model_options else 3,
     )
 
-    rule_options = ["Fijo por círculo", "Según perímetro", "Porcentaje de puntos estándar"]
-    default_rule = params.get("multilevel_rule", "Según perímetro")
-    multilevel_rule = st.selectbox(
-        "Regla para puntos multinivel",
-        rule_options,
-        index=rule_options.index(default_rule) if default_rule in rule_options else 1,
-    )
-
-    multilevel_pct = st.number_input(
-        "Porcentaje multinivel sobre puntos estándar",
-        min_value=0.0,
-        max_value=1.0,
-        value=float(params.get("multilevel_pct", 0.10)),
-        step=0.01,
-        help="Solo se usa si eliges la regla porcentual. También puede venir desde el Excel de parámetros.",
+    # Regla fija: el usuario solo modifica el valor numérico
+    # "Puntos multinivel mínimos por círculo" en la sección D.
+    multilevel_rule = "Fijo por círculo"
+    multilevel_pct = float(params.get("multilevel_pct", 0.10))
+    st.caption(
+        "Puntos multinivel: valor fijo leído del Excel y editable abajo en "
+        "**D. Requisitos mínimos**."
     )
     ga_generations = st.number_input(
         "Generaciones algoritmo genético",
@@ -978,7 +966,11 @@ st.subheader("D. Requisitos mínimos")
 r1, r2, r3 = st.columns(3)
 with r1:
     min_multilevel_per_circle = st.number_input(
-        "Puntos multinivel mínimos por círculo", min_value=0, value=int(params["min_multilevel_per_circle"]), step=1
+        "Puntos multinivel fijos por círculo",
+        min_value=0,
+        value=int(params["min_multilevel_per_circle"]),
+        step=1,
+        help="Este valor se lee del Excel de parámetros y puede ajustarse manualmente antes de resolver.",
     )
 with r2:
     min_24h = st.number_input("Mediciones 24 h mínimas", min_value=0, value=int(params["min_24h"]), step=1)
