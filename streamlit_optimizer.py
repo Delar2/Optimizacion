@@ -318,6 +318,44 @@ def build_model(circles, separations, field, lab, params):
         "n_points": n_points,
         "field_qty_expr": field_qty_expr,
         "total_field_samples": total_field_samples,
+        "total_time_expr": total_time,
+    }
+
+
+def solve_relaxed_minimums(circles, separations, field, lab, params, time_limit_sec=30):
+    """Calcula mínimos auxiliares relajando presupuesto y capacidad de tiempo.
+
+    Sirve para explicar por qué algunas separaciones vuelven infactible el modelo.
+    No reemplaza la optimización lexicográfica final.
+    """
+    relaxed_params = dict(params)
+    relaxed_params["budget"] = 1e15
+    relaxed_params["days"] = 1e9
+
+    objects_time = build_model(circles, separations, field, lab, relaxed_params)
+    m_time = objects_time["model"]
+    m_time.sense = pulp.LpMinimize
+    m_time.setObjective(objects_time["total_time_expr"])
+    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit_sec)
+    status_time = m_time.solve(solver)
+    min_time = None
+    if pulp.LpStatus[status_time] == "Optimal":
+        min_time = float(pulp.value(objects_time["total_time_expr"]))
+
+    objects_cost = build_model(circles, separations, field, lab, relaxed_params)
+    m_cost = objects_cost["model"]
+    m_cost.sense = pulp.LpMinimize
+    m_cost.setObjective(objects_cost["vars"]["total_used"])
+    status_cost = m_cost.solve(solver)
+    min_cost = None
+    if pulp.LpStatus[status_cost] == "Optimal":
+        min_cost = float(pulp.value(objects_cost["vars"]["total_used"]))
+
+    return {
+        "status_time": pulp.LpStatus[status_time],
+        "min_time_h": min_time,
+        "status_cost": pulp.LpStatus[status_cost],
+        "min_cost": min_cost,
     }
 
 
@@ -493,7 +531,8 @@ with col1:
 with col2:
     st.markdown("### Separaciones permitidas")
     separations = st.data_editor(separations0, num_rows="dynamic", use_container_width=True, key="separations")
-    st.caption("Este conjunto no venía en los Excel reales; puedes cambiarlo antes de resolver.")
+    st.caption("Este conjunto no venía en los Excel reales. La información queda cargada, pero puedes editarla antes de ejecutar la optimización.")
+    st.info("Tip: separaciones muy pequeñas, por ejemplo 2–10 m, aumentan mucho los puntos `ceil(perímetro/separación)` y pueden volver infactible el modelo por tiempo.")
 
 col3, col4 = st.columns(2)
 with col3:
@@ -503,9 +542,75 @@ with col4:
     st.markdown("### Análisis de laboratorio")
     lab = st.data_editor(lab0, num_rows="dynamic", use_container_width=True, key="lab")
 
-st.subheader("2. Resolver modelo")
+st.subheader("2. Diagnóstico y resolución")
 
-if st.button("Ejecutar optimización", type="primary"):
+col_diag, col_run = st.columns([1, 1])
+with col_diag:
+    run_diagnostic = st.button("Diagnóstico de factibilidad", type="secondary")
+with col_run:
+    run_optimization = st.button("Ejecutar optimización", type="primary")
+
+if run_diagnostic:
+    try:
+        circles_c, separations_c, field_c, lab_c = clean_inputs(circles, separations, field, lab)
+        params = {
+            "budget": budget,
+            "days": days,
+            "hours_per_day": hours_per_day,
+            "daily_field_cost": daily_field_cost,
+            "max_teams": max_teams,
+            "w_field": w_field,
+            "w_lab": w_lab,
+            "couple_lab_to_field": couple_lab_to_field,
+        }
+        diag = solve_relaxed_minimums(circles_c, separations_c, field_c, lab_c, params, time_limit_sec=min(time_limit_sec, 60))
+        capacity_h = float(days) * float(hours_per_day) * int(max_teams)
+        st.markdown("### Diagnóstico rápido")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Capacidad real", f"{capacity_h:,.0f} h")
+        c2.metric("Tiempo mínimo estimado", "—" if diag["min_time_h"] is None else f"{diag['min_time_h']:,.0f} h")
+        c3.metric("Costo mínimo estimado", "—" if diag["min_cost"] is None else money(diag["min_cost"]))
+        if diag["min_time_h"] is not None and diag["min_time_h"] > capacity_h:
+            st.error(
+                "Con estas separaciones, el tiempo mínimo requerido supera la capacidad disponible. "
+                "Prueba separaciones mayores, más días, más equipos, o relaja mínimos/actividades obligatorias."
+            )
+        elif diag["min_cost"] is not None and diag["min_cost"] > budget:
+            st.error(
+                "Con estas entradas, el costo mínimo requerido supera el presupuesto. "
+                "Prueba aumentar presupuesto o reducir mínimos/costos."
+            )
+        else:
+            st.success("El diagnóstico básico no detectó una violación de tiempo o presupuesto. Puedes ejecutar la optimización completa.")
+    except Exception as exc:
+        st.error(str(exc))
+        try:
+            circles_c, separations_c, field_c, lab_c = clean_inputs(circles, separations, field, lab)
+            params = {
+                "budget": budget,
+                "days": days,
+                "hours_per_day": hours_per_day,
+                "daily_field_cost": daily_field_cost,
+                "max_teams": max_teams,
+                "w_field": w_field,
+                "w_lab": w_lab,
+                "couple_lab_to_field": couple_lab_to_field,
+            }
+            diag = solve_relaxed_minimums(circles_c, separations_c, field_c, lab_c, params, time_limit_sec=min(time_limit_sec, 60))
+            capacity_h = float(days) * float(hours_per_day) * int(max_teams)
+            st.markdown("#### Posible causa")
+            if diag["min_time_h"] is not None:
+                st.write(f"Capacidad real: **{capacity_h:,.0f} h**. Tiempo mínimo requerido con estas separaciones: **{diag['min_time_h']:,.0f} h**.")
+                if diag["min_time_h"] > capacity_h:
+                    st.warning("El modelo no alcanza la capacidad de tiempo. Usa separaciones más grandes o aumenta días/equipos.")
+            if diag["min_cost"] is not None:
+                st.write(f"Presupuesto real: **{money(budget)}**. Costo mínimo requerido: **{money(diag['min_cost'])}**.")
+                if diag["min_cost"] > budget:
+                    st.warning("El modelo no alcanza el presupuesto mínimo requerido. Aumenta presupuesto o reduce mínimos/costos.")
+        except Exception:
+            pass
+
+if run_optimization:
     try:
         circles_c, separations_c, field_c, lab_c = clean_inputs(circles, separations, field, lab)
         params = {
@@ -561,6 +666,31 @@ if st.button("Ejecutar optimización", type="primary"):
         )
     except Exception as exc:
         st.error(str(exc))
+        try:
+            circles_c, separations_c, field_c, lab_c = clean_inputs(circles, separations, field, lab)
+            params = {
+                "budget": budget,
+                "days": days,
+                "hours_per_day": hours_per_day,
+                "daily_field_cost": daily_field_cost,
+                "max_teams": max_teams,
+                "w_field": w_field,
+                "w_lab": w_lab,
+                "couple_lab_to_field": couple_lab_to_field,
+            }
+            diag = solve_relaxed_minimums(circles_c, separations_c, field_c, lab_c, params, time_limit_sec=min(time_limit_sec, 60))
+            capacity_h = float(days) * float(hours_per_day) * int(max_teams)
+            st.markdown("#### Posible causa")
+            if diag["min_time_h"] is not None:
+                st.write(f"Capacidad real: **{capacity_h:,.0f} h**. Tiempo mínimo requerido con estas separaciones: **{diag['min_time_h']:,.0f} h**.")
+                if diag["min_time_h"] > capacity_h:
+                    st.warning("El modelo no alcanza la capacidad de tiempo. Usa separaciones más grandes o aumenta días/equipos.")
+            if diag["min_cost"] is not None:
+                st.write(f"Presupuesto real: **{money(budget)}**. Costo mínimo requerido: **{money(diag['min_cost'])}**.")
+                if diag["min_cost"] > budget:
+                    st.warning("El modelo no alcanza el presupuesto mínimo requerido. Aumenta presupuesto o reduce mínimos/costos.")
+        except Exception:
+            pass
 
 with st.expander("Notas del modelo implementado"):
     st.markdown(
@@ -571,6 +701,7 @@ with st.expander("Notas del modelo implementado"):
         - La etapa 2 minimiza desviaciones internas dentro de campo y laboratorio, fijando el resultado de la etapa 1.
         - La etapa 3 maximiza el presupuesto utilizado, fijando las desviaciones óptimas de las etapas anteriores.
         - Para evitar falsos `Infeasible` por tolerancia numérica, el fijado lexicográfico usa una tolerancia mínima de COP 1.000.
+        - La app incluye un diagnóstico auxiliar para estimar si una combinación de separaciones exige más horas o presupuesto del disponible.
         - Los pesos AHP locales se normalizan automáticamente dentro de cada bloque.
         - El archivo de parámetros original contiene algunas referencias externas. Para evitar errores en Streamlit Cloud, la app usa los valores guardados y respaldos explícitos para costos clave.
         """
