@@ -1,6 +1,5 @@
 streamlit
 pandas
-openpyxl
+numpy
 pulp
-plotly
-xlsxwriter
+openpyxl
