@@ -326,7 +326,11 @@ def solve_lexicographic(objects, time_limit_sec=60):
     _, _, field_codes, lab_codes = objects["sets"]
     v = objects["vars"]
     solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit_sec)
-    eps = 1e-5
+    # Tolerancia lexicográfica en COP.
+    # Usar 1e-5 COP es demasiado estricto para un MILP con costos grandes
+    # e integridad/discretización; CBC puede declarar infeasible por tolerancias numéricas.
+    def lex_tol(value):
+        return max(1000.0, 1e-6 * abs(float(value)))
 
     z1_expr = v["dev_block_field"] + v["dev_block_lab"]
     m.sense = pulp.LpMinimize
@@ -335,7 +339,7 @@ def solve_lexicographic(objects, time_limit_sec=60):
     if pulp.LpStatus[status1] != "Optimal":
         raise RuntimeError(f"Etapa 1 no factible u óptimo no encontrado: {pulp.LpStatus[status1]}")
     z1 = pulp.value(z1_expr)
-    m += z1_expr <= z1 + eps, "fix_Z1"
+    m += z1_expr <= z1 + lex_tol(z1), "fix_Z1"
 
     z2_expr = pulp.lpSum(v["dev_field"][k] for k in field_codes) + pulp.lpSum(v["dev_lab"][a] for a in lab_codes)
     m.sense = pulp.LpMinimize
@@ -344,7 +348,7 @@ def solve_lexicographic(objects, time_limit_sec=60):
     if pulp.LpStatus[status2] != "Optimal":
         raise RuntimeError(f"Etapa 2 no factible u óptimo no encontrado: {pulp.LpStatus[status2]}")
     z2 = pulp.value(z2_expr)
-    m += z2_expr <= z2 + eps, "fix_Z2"
+    m += z2_expr <= z2 + lex_tol(z2), "fix_Z2"
 
     m.sense = pulp.LpMaximize
     m.setObjective(v["total_used"])
@@ -566,6 +570,7 @@ with st.expander("Notas del modelo implementado"):
         - La etapa 1 minimiza desviaciones entre bloques AHP: campo vs. laboratorio.
         - La etapa 2 minimiza desviaciones internas dentro de campo y laboratorio, fijando el resultado de la etapa 1.
         - La etapa 3 maximiza el presupuesto utilizado, fijando las desviaciones óptimas de las etapas anteriores.
+        - Para evitar falsos `Infeasible` por tolerancia numérica, el fijado lexicográfico usa una tolerancia mínima de COP 1.000.
         - Los pesos AHP locales se normalizan automáticamente dentro de cada bloque.
         - El archivo de parámetros original contiene algunas referencias externas. Para evitar errores en Streamlit Cloud, la app usa los valores guardados y respaldos explícitos para costos clave.
         """
