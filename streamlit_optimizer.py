@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 from ortools.sat.python import cp_model
 
@@ -29,10 +28,13 @@ if "last_solution_bundle" not in st.session_state:
 #   al menos 1 unidad.
 # - Se agrega saturación operativa por transecta: N_min <= puntos_i <= N_max.
 # - Se mantienen presupuesto, capacidad por turno, conservación de muestras y AHP.
+# - Se permite t_f,w decimal usando escalamiento interno de tiempo.
+# - Se agrega etapa 4 para minimizar la desviación total de separaciones respecto a una separación de referencia.
 # =========================================================
 
 SHIFTS = ["Dia", "Noche"]
 W_SCALE = 10_000
+TIME_SCALE = 100  # permite tiempos decimales en centésimas de hora para CP-SAT
 LEXI_TOL_PCT = 0.0025
 DEFAULT_MIN_BUDGET_USE = 0.0
 DEFAULT_COSTO_DIA_COP_H = int(round(1_500_000 / 9))
@@ -368,7 +370,7 @@ def model_equations_table() -> pd.DataFrame:
         ("Techo físico especializado", "Q_f <= Q_puntual para todo f != puntual"),
         ("Cotas mínimas campo", "Q_f >= 1 si alpha_f > 0"),
         ("Cotas mínimas laboratorio", "L_k >= 1 si gamma_k > 0"),
-        ("Costo campo", "C_f = Q_f * sum_w c_h,f,w * t_f,w"),
+        ("Costo campo", "C_f = Q_f * sum_w c_h,f,w * t_f,w; t_f,w puede ser decimal y se escala internamente para CP-SAT"),
         ("Costo lab", "C_k = c_lab,k * L_k"),
         ("Agregados", "C_field=sum_f C_f; C_lab=sum_k C_k; C_used=C_field+C_lab"),
         ("Presupuesto", "C_used <= C_total"),
@@ -381,6 +383,9 @@ def model_equations_table() -> pd.DataFrame:
         ("Etapa 1", "min Z1 = eF-+eF+ + eL-+eL+"),
         ("Etapa 2", "min Z2 = sum_f(d_f-+d_f+) + sum_k(u_k-+u_k+) sujeto a Z1 <= Z1* + epsilon"),
         ("Etapa 3", "max C_used sujeto a Z1 <= Z1* + epsilon y Z2 <= Z2* + epsilon"),
+        ("Separación por transecta", "s_i = sum_s s * y_i,s"),
+        ("Desviación de separación", "delta_i >= s_i - s_ref; delta_i >= s_ref - s_i"),
+        ("Etapa 4", "min sum_i delta_i preservando Z1*, Z2* y C_used*"),
     ]
     return pd.DataFrame(rows, columns=["Bloque", "Ecuación implementada"])
 
@@ -445,7 +450,7 @@ def solve_milp_ahp_modified(
     lab_df: pd.DataFrame,
     budget_cop: int,
     days_available: int,
-    hours_per_shift: int,
+    hours_per_shift: float,
     max_teams: int,
     beta_field: float,
     beta_lab: float,
@@ -482,12 +487,13 @@ def solve_milp_ahp_modified(
     t, c_h = {}, {}
     for _, row in field_df.iterrows():
         f = row["actividad"]
-        t[(f, "Dia")] = int(round(float(row["t_Dia_h"])))
-        t[(f, "Noche")] = int(round(float(row["t_Noche_h"])))
+        t[(f, "Dia")] = int(round(float(row["t_Dia_h"]) * TIME_SCALE))
+        t[(f, "Noche")] = int(round(float(row["t_Noche_h"]) * TIME_SCALE))
         c_h[(f, "Dia")] = int(round(float(row["c_h_Dia_COP_h"])))
         c_h[(f, "Noche")] = int(round(float(row["c_h_Noche_COP_h"])))
     lab_cost = dict(zip(K, lab_df["c_lab_COP_muestra"].round().astype(int)))
     n = {(i, s): compute_n_points(length[i], s) for i in I for s in separations}
+    s_min, s_max = int(min(separations)), int(max(separations))
 
     infeasible_saturation = []
     for i in I:
@@ -524,9 +530,19 @@ def solve_milp_ahp_modified(
     Clab = model.NewIntVar(0, budget, "Clab")
     Cused = model.NewIntVar(0, budget, "Cused")
 
+    # Variables para homogeneidad de separaciones (etapa 4)
+    s_assigned = {i: model.NewIntVar(s_min, s_max, f"s_assigned__{i}") for i in I}
+    s_ref = model.NewIntVar(s_min, s_max, "s_ref")
+    delta_sep = {i: model.NewIntVar(0, max(0, s_max - s_min), f"delta_sep__{i}") for i in I}
+    Z_sep = model.NewIntVar(0, max(1, len(I) * max(0, s_max - s_min)), "Z_sep")
+
     # 4.1.1 Selección única por transecta para muestreo puntual
     for i in I:
         model.Add(sum(y[(i, s)] for s in separations) == 1)
+        model.Add(s_assigned[i] == sum(int(s) * y[(i, s)] for s in separations))
+        model.Add(delta_sep[i] >= s_assigned[i] - s_ref)
+        model.Add(delta_sep[i] >= s_ref - s_assigned[i])
+    model.Add(Z_sep == sum(delta_sep[i] for i in I))
 
     # 4.1.3 Restricción de saturación operativa por transecta
     # Impide sub-muestreo y sobre-muestreo en cada transecta.
@@ -552,7 +568,7 @@ def solve_milp_ahp_modified(
 
     # 4.3.1 Costos de campo
     for f in F:
-        cost_per_unit_base = sum(c_h[(f, w)] * t[(f, w)] for w in W)
+        cost_per_unit_base = sum(c_h[(f, w)] * t[(f, w)] for w in W) / TIME_SCALE
         cost_per_unit = int(round(cost_per_unit_base))
         model.Add(Cf[f] == cost_per_unit * Q[f])
 
@@ -567,8 +583,9 @@ def solve_milp_ahp_modified(
     model.Add(Cused <= budget)
 
     # 4.2.2 Capacidad operativa por turno
+    hours_per_shift_scaled = int(round(float(hours_per_shift) * TIME_SCALE))
     for w in W:
-        model.Add(sum(t[(f, w)] * Q[f] for f in F) <= E[w] * int(days_available) * int(hours_per_shift))
+        model.Add(sum(t[(f, w)] * Q[f] for f in F) <= E[w] * int(days_available) * hours_per_shift_scaled)
         model.Add(E[w] <= int(max_teams))
 
     # 4.5.1 Conservación de muestras
@@ -621,15 +638,15 @@ def solve_milp_ahp_modified(
         cfield_val = int(solver.Value(Cfield))
         clab_val = int(solver.Value(Clab))
         cused_val = int(solver.Value(Cused))
-        total_time_by_shift = {w: int(sum(t[(f, w)] * solver.Value(Q[f]) for f in F)) for w in W}
+        total_time_by_shift = {w: sum(t[(f, w)] * solver.Value(Q[f]) for f in F) / TIME_SCALE for w in W}
 
         field_rows = []
         for f in F:
             q = int(solver.Value(Q[f]))
-            day_h = int(t[(f, "Dia")] * q)
-            night_h = int(t[(f, "Noche")] * q)
+            day_h = (t[(f, "Dia")] * q) / TIME_SCALE
+            night_h = (t[(f, "Noche")] * q) / TIME_SCALE
             cost = int(solver.Value(Cf[f]))
-            cost_unit_base = sum(c_h[(f, w)] * t[(f, w)] for w in W)
+            cost_unit_base = sum(c_h[(f, w)] * t[(f, w)] for w in W) / TIME_SCALE
             cost_unit = int(round(cost_unit_base))
             field_rows.append({
                 "actividad": f,
@@ -676,10 +693,10 @@ def solve_milp_ahp_modified(
                     chosen_s = s
                     chosen_points = int(n[(i, s)])
                     break
-            cost_base = chosen_points * sum(c_h[(puntual, w)] * t[(puntual, w)] for w in W)
+            cost_base = chosen_points * (sum(c_h[(puntual, w)] * t[(puntual, w)] for w in W) / TIME_SCALE)
             cost = int(round(cost_base))
-            day_h = chosen_points * t[(puntual, "Dia")]
-            night_h = chosen_points * t[(puntual, "Noche")]
+            day_h = chosen_points * t[(puntual, "Dia")] / TIME_SCALE
+            night_h = chosen_points * t[(puntual, "Noche")] / TIME_SCALE
             punctual_by_circle.append((i, chosen_points))
             plan_rows.append({
                 "transecta": i,
@@ -687,6 +704,8 @@ def solve_milp_ahp_modified(
                 "actividad": puntual,
                 "tipo_resultado": "puntual_por_transecta",
                 "separacion_m": chosen_s,
+                "separacion_referencia_m": int(solver.Value(s_ref)),
+                "desviacion_separacion_m": int(solver.Value(delta_sep[i])),
                 "puntos": chosen_points,
                 "N_min": n_min,
                 "N_max": n_max,
@@ -706,16 +725,18 @@ def solve_milp_ahp_modified(
             for i, pts in allocation.items():
                 if int(pts) <= 0:
                     continue
-                cost_base = int(pts) * sum(c_h[(f, w)] * t[(f, w)] for w in W)
+                cost_base = int(pts) * (sum(c_h[(f, w)] * t[(f, w)] for w in W) / TIME_SCALE)
                 cost = int(round(cost_base))
-                day_h = int(pts) * t[(f, "Dia")]
-                night_h = int(pts) * t[(f, "Noche")]
+                day_h = int(pts) * t[(f, "Dia")] / TIME_SCALE
+                night_h = int(pts) * t[(f, "Noche")] / TIME_SCALE
                 plan_rows.append({
                     "transecta": i,
                     "longitud_m": length[i],
                     "actividad": f,
                     "tipo_resultado": "especializado_sugerido_por_transecta",
                     "separacion_m": "no aplica",
+                    "separacion_referencia_m": "no aplica",
+                    "desviacion_separacion_m": "no aplica",
                     "puntos": int(pts),
                     "N_min": "no aplica",
                     "N_max": "no aplica",
@@ -741,6 +762,8 @@ def solve_milp_ahp_modified(
                 "Muestras puntuales base": int(solver.Value(Q[puntual])),
                 "N_min puntos/transecta": n_min,
                 "N_max puntos/transecta": n_max,
+                "Separación referencia m": int(solver.Value(s_ref)),
+                "Desviación total separaciones m": int(solver.Value(Z_sep)),
                 "Equipos dia": int(solver.Value(E["Dia"])),
                 "Equipos noche": int(solver.Value(E["Noche"])),
                 "Tiempo campo dia h": total_time_by_shift["Dia"],
@@ -796,7 +819,20 @@ def solve_milp_ahp_modified(
         best_solution["warning"] = "La etapa 3 no encontró solución; se muestra etapa 2."
         best_solution["logs"] = logs
         return {"ok": True, **best_solution}
-    final_solution = extract("Etapa 3", status3)
+    best_solution = extract("Etapa 3", status3)
+    cused_value = int(solver.Value(Cused))
+
+    # Etapa 4: entre las soluciones óptimas anteriores, escoger separaciones más homogéneas
+    model.Add(Cused >= cused_value)
+    model.Minimize(Z_sep)
+    status4 = solver.Solve(model)
+    logs.append({"etapa": "4. Homogeneización de separaciones entre transectas", "estado": status_name(status4)})
+    if not is_good(status4):
+        best_solution["warning"] = "La etapa 4 no encontró solución; se muestra etapa 3."
+        best_solution["logs"] = logs
+        return {"ok": True, **best_solution}
+
+    final_solution = extract("Etapa 4", status4)
     final_solution["logs"] = logs
     return {"ok": True, **final_solution}
 
@@ -806,7 +842,7 @@ def solve_milp_ahp_modified(
 # -----------------------------
 
 st.title("🧪 Optimización MILP-AHP para estrategias de muestreo")
-st.caption("Versión final: separación única por transecta, L_i como longitud de transecta, n_i,s = max(1, floor(L_i/s)+1), saturación N_min/N_max, techo físico y cotas mínimas por AHP > 0.")
+st.caption("Versión final: transectas, tiempos decimales, homogeneidad de separaciones como etapa 4, saturación N_min/N_max, techo físico y cotas mínimas por AHP > 0.")
 
 with st.sidebar:
     st.header("1) Datos")
@@ -847,7 +883,7 @@ with c1:
 with c2:
     days = st.number_input("T_max: Días disponibles", value=int(_safe_float(params.get("T_max"), 60)), min_value=1, step=1)
 with c3:
-    hours = st.number_input("H_turno: Horas por turno", value=int(_safe_float(params.get("H_turno"), 8)), min_value=1, max_value=24, step=1)
+    hours = st.number_input("H_turno: Horas por turno", value=float(_safe_float(params.get("H_turno"), 8)), min_value=0.5, max_value=24.0, step=0.5, format="%.2f")
 with c4:
     max_teams = st.number_input("E_max: Equipos máximos por turno", value=int(_safe_float(params.get("E_max"), 3)), min_value=1, step=1)
 
@@ -895,8 +931,8 @@ with left:
         use_container_width=True,
         column_config={
             "alpha_f": st.column_config.NumberColumn("α_f", min_value=0.0, max_value=1.0, format="%.4f"),
-            "t_Dia_h": st.column_config.NumberColumn("t_f,Día (h)", min_value=0, step=1),
-            "t_Noche_h": st.column_config.NumberColumn("t_f,Noche (h)", min_value=0, step=1),
+            "t_Dia_h": st.column_config.NumberColumn("t_f,Día (h)", min_value=0.0, step=0.25, format="%.2f"),
+            "t_Noche_h": st.column_config.NumberColumn("t_f,Noche (h)", min_value=0.0, step=0.25, format="%.2f"),
             "c_h_Dia_COP_h": st.column_config.NumberColumn("c_h,f,Día COP/h", min_value=0, step=10_000),
             "c_h_Noche_COP_h": st.column_config.NumberColumn("c_h,f,Noche COP/h", min_value=0, step=10_000),
         },
@@ -950,7 +986,7 @@ if run:
         params_used = {
             "C_total": int(budget),
             "T_max": int(days),
-            "H_turno": int(hours),
+            "H_turno": float(hours),
             "E_max": int(max_teams),
             "beta_F": float(beta_f),
             "beta_L": float(beta_l),
@@ -967,7 +1003,7 @@ if run:
                 lab_df=clean_lab,
                 budget_cop=int(budget),
                 days_available=int(days),
-                hours_per_shift=int(hours),
+                hours_per_shift=float(hours),
                 max_teams=int(max_teams),
                 beta_field=float(beta_f),
                 beta_lab=float(beta_l),
@@ -1036,9 +1072,9 @@ if bundle is not None:
         {"bloque": "Laboratorio", "tipo": "Objetivo AHP", "valor": kpis["Lab objetivo AHP %"]},
         {"bloque": "Laboratorio", "tipo": "Real", "valor": kpis["Lab real %"]},
     ])
-    fig = px.bar(global_alloc, x="bloque", y="valor", color="tipo", barmode="group", text_auto=".1%")
-    fig.update_layout(yaxis_tickformat=".0%", yaxis_title="Participación del presupuesto", xaxis_title="")
-    st.plotly_chart(fig, use_container_width=True)
+    global_chart = global_alloc.pivot(index="bloque", columns="tipo", values="valor")
+    st.bar_chart(global_chart, use_container_width=True)
+    st.caption("Valores mostrados como fracción del presupuesto; por ejemplo, 0.64 equivale a 64 %.")
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["Plan", "Campo", "Laboratorio", "Modelo usado", "Log solver"])
     with tab1:
@@ -1058,9 +1094,9 @@ if bundle is not None:
                 var_name="tipo",
                 value_name="valor",
             )
-            fig_f = px.bar(field_plot, x="actividad", y="valor", color="tipo", barmode="group", text_auto=".1%")
-            fig_f.update_layout(yaxis_tickformat=".0%", xaxis_title="", yaxis_title="Participación dentro de campo")
-            st.plotly_chart(fig_f, use_container_width=True)
+            field_chart = field_plot.pivot(index="actividad", columns="tipo", values="valor")
+            st.bar_chart(field_chart, use_container_width=True)
+            st.caption("Valores mostrados como fracción dentro de campo; por ejemplo, 0.25 equivale a 25 %.")
     with tab3:
         st.markdown("**Resumen global de laboratorio**")
         st.dataframe(result["lab"], use_container_width=True)
@@ -1074,9 +1110,9 @@ if bundle is not None:
                 var_name="tipo",
                 value_name="valor",
             )
-            fig_l = px.bar(lab_plot, x="analisis", y="valor", color="tipo", barmode="group", text_auto=".1%")
-            fig_l.update_layout(yaxis_tickformat=".0%", xaxis_title="", yaxis_title="Participación dentro de laboratorio")
-            st.plotly_chart(fig_l, use_container_width=True)
+            lab_chart = lab_plot.pivot(index="analisis", columns="tipo", values="valor")
+            st.bar_chart(lab_chart, use_container_width=True)
+            st.caption("Valores mostrados como fracción dentro de laboratorio; por ejemplo, 0.25 equivale a 25 %.")
     with tab4:
         st.dataframe(model_equations_table(), use_container_width=True)
     with tab5:
