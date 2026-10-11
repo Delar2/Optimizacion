@@ -1,708 +1,1094 @@
+import io
 import math
-import os
-import re
-from io import BytesIO
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
-import numpy as np
 import pandas as pd
-import pulp
+import plotly.express as px
 import streamlit as st
-
+from ortools.sat.python import cp_model
 
 st.set_page_config(
-    page_title="Optimización MILP-AHP para muestreo de H₂",
+    page_title="MILP-AHP | Transectas y saturación operativa",
+    page_icon="🧪",
     layout="wide",
 )
 
-st.title("Optimización MILP-AHP / Goal Programming")
-st.caption("Asignación de recursos para estrategias de muestreo de seeps de hidrógeno")
+if "last_solution_bundle" not in st.session_state:
+    st.session_state.last_solution_bundle = None
 
-BASE_DIR = os.path.dirname(__file__)
-DEFAULT_CIRCLES_XLSX = os.path.join(BASE_DIR, "Circulos.xlsx")
-DEFAULT_PARAMS_XLSX = os.path.join(BASE_DIR, "Parametros.xlsx")
+# =========================================================
+# MODELO MODIFICADO: TRANSECTAS
+# =========================================================
+# Cambios principales respecto a la versión anterior:
+# - La separación se elige una sola vez por transecta y aplica al muestreo puntual base.
+# - Q_puntual se calcula desde la longitud de cada transecta y las separaciones.
+# - Los muestreos especializados (24h, largo/extendido, multinivel) son cantidades
+#   totales y no pueden superar Q_puntual.
+# - Se agregan cotas mínimas: cualquier técnica/análisis con peso AHP > 0 debe tener
+#   al menos 1 unidad.
+# - Se agrega saturación operativa por transecta: N_min <= puntos_i <= N_max.
+# - Se mantienen presupuesto, capacidad por turno, conservación de muestras y AHP.
+# =========================================================
+
+SHIFTS = ["Dia", "Noche"]
+W_SCALE = 10_000
+LEXI_TOL_PCT = 0.0025
+DEFAULT_MIN_BUDGET_USE = 0.0
+DEFAULT_COSTO_DIA_COP_H = int(round(1_500_000 / 9))
+DEFAULT_COSTO_NOCHE_COP_H = 250_000
+DEFAULT_N_MIN = 1
+DEFAULT_N_MAX = 999999
 
 
-def _num(x, default=0.0):
+@dataclass
+class ParsedData:
+    params: Dict[str, float]
+    circles: pd.DataFrame
+    separations: pd.DataFrame
+    field_df: pd.DataFrame
+    lab_df: pd.DataFrame
+
+
+PARAM_DEFAULTS = [
+    {"Parametro": "T_max", "Descripcion": "Días totales disponibles para el muestreo", "Unidad": "dias", "Valor": 60},
+    {"Parametro": "H_turno", "Descripcion": "Horas efectivas de trabajo por turno", "Unidad": "h/turno", "Valor": 8},
+    {"Parametro": "C_total", "Descripcion": "Presupuesto total disponible", "Unidad": "COP", "Valor": 446852500},
+    {"Parametro": "E_max", "Descripcion": "Número máximo de equipos de trabajo disponibles por turno", "Unidad": "equipos", "Valor": 3},
+    {"Parametro": "beta_F", "Descripcion": "Peso AHP de primer nivel del bloque campo", "Unidad": "proporcion", "Valor": 0.6420},
+    {"Parametro": "beta_L", "Descripcion": "Peso AHP de primer nivel del bloque laboratorio", "Unidad": "proporcion", "Valor": 0.3580},
+    {"Parametro": "N_min", "Descripcion": "Número mínimo de puntos puntuales requeridos por transecta", "Unidad": "puntos/transecta", "Valor": DEFAULT_N_MIN},
+    {"Parametro": "N_max", "Descripcion": "Número máximo de puntos puntuales permitidos por transecta", "Unidad": "puntos/transecta", "Valor": DEFAULT_N_MAX},
+    {"Parametro": "actividad_puntual_base", "Descripcion": "Nombre de la actividad base que usa separación por transecta", "Unidad": "texto", "Valor": "Muestreo puntual estándar"},
+]
+
+DEFAULT_CIRCLES = [
+    {"ID": "T1", "Longitud_m": 113.0},
+    {"ID": "T2", "Longitud_m": 164.0},
+    {"ID": "T3", "Longitud_m": 702.0},
+]
+
+DEFAULT_SEPARATIONS = [
+    {"separacion_m": 10},
+    {"separacion_m": 20},
+    {"separacion_m": 50},
+]
+
+DEFAULT_FIELD_ROWS = [
+    {"actividad": "Muestreo puntual estándar", "alpha_f": 0.3758, "t_Dia_h": 1, "t_Noche_h": 0, "c_h_Dia_COP_h": DEFAULT_COSTO_DIA_COP_H, "c_h_Noche_COP_h": DEFAULT_COSTO_NOCHE_COP_H},
+    {"actividad": "Medición 24 horas", "alpha_f": 0.2268, "t_Dia_h": 15, "t_Noche_h": 9, "c_h_Dia_COP_h": DEFAULT_COSTO_DIA_COP_H, "c_h_Noche_COP_h": DEFAULT_COSTO_NOCHE_COP_H},
+    {"actividad": "Medición largo plazo", "alpha_f": 0.0820, "t_Dia_h": 60, "t_Noche_h": 61, "c_h_Dia_COP_h": DEFAULT_COSTO_DIA_COP_H, "c_h_Noche_COP_h": DEFAULT_COSTO_NOCHE_COP_H},
+    {"actividad": "Muestreo multinivel", "alpha_f": 0.3154, "t_Dia_h": 3, "t_Noche_h": 0, "c_h_Dia_COP_h": DEFAULT_COSTO_DIA_COP_H, "c_h_Noche_COP_h": DEFAULT_COSTO_NOCHE_COP_H},
+]
+
+DEFAULT_LAB_ROWS = [
+    {"analisis": "Cromatografía de Gas", "gamma_k": 0.4221, "c_lab_COP_muestra": 1190000},
+    {"analisis": "Isotopía de Deuterio", "gamma_k": 0.2506, "c_lab_COP_muestra": 6538812},
+    {"analisis": "Isotopía de Helio", "gamma_k": 0.1223, "c_lab_COP_muestra": 6538812},
+    {"analisis": "Caracterización mineralógica", "gamma_k": 0.1115, "c_lab_COP_muestra": 1953385},
+    {"analisis": "Biogeoquímica", "gamma_k": 0.0935, "c_lab_COP_muestra": 3015249},
+]
+
+
+def default_manual_data() -> ParsedData:
+    params = {row["Parametro"]: row["Valor"] for row in PARAM_DEFAULTS}
+    return ParsedData(
+        params=params,
+        circles=pd.DataFrame(DEFAULT_CIRCLES),
+        separations=pd.DataFrame(DEFAULT_SEPARATIONS),
+        field_df=pd.DataFrame(DEFAULT_FIELD_ROWS),
+        lab_df=pd.DataFrame(DEFAULT_LAB_ROWS),
+    )
+
+
+def build_template_excel_bytes() -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pd.DataFrame(PARAM_DEFAULTS).to_excel(writer, sheet_name="Parametros", index=False)
+        pd.DataFrame(DEFAULT_CIRCLES).to_excel(writer, sheet_name="Transectas", index=False)
+        pd.DataFrame(DEFAULT_SEPARATIONS).to_excel(writer, sheet_name="Separaciones", index=False)
+        pd.DataFrame(DEFAULT_FIELD_ROWS).to_excel(writer, sheet_name="Campo", index=False)
+        pd.DataFrame(DEFAULT_LAB_ROWS).to_excel(writer, sheet_name="Laboratorio", index=False)
+        notes = pd.DataFrame([
+            {"Hoja": "Parametros", "Descripcion": "Incluye T_max, H_turno, C_total, E_max, beta_F, beta_L, N_min, N_max y actividad_puntual_base."},
+            {"Hoja": "Transectas", "Descripcion": "Conjunto I. Columnas: ID, Longitud_m. Longitud_m representa la longitud total de la transecta."},
+            {"Hoja": "Separaciones", "Descripcion": "Conjunto S. Columna: separacion_m. El modelo elige exactamente una separación por transecta para muestreo puntual."},
+            {"Hoja": "Campo", "Descripcion": "Conjunto F. Una fila debe corresponder al muestreo puntual base. Las otras actividades son especializadas y cumplen Q_f <= Q_puntual."},
+            {"Hoja": "Laboratorio", "Descripcion": "Conjunto K. Si gamma_k > 0, el modelo fuerza L_k >= 1."},
+            {"Hoja": "Modelo", "Descripcion": "Saturación operativa: N_min <= puntos_i <= N_max. Cotas mínimas: si alpha_f > 0 entonces Q_f >= 1; si gamma_k > 0 entonces L_k >= 1. Conservación: sum_k L_k <= sum_f Q_f."},
+        ])
+        notes.to_excel(writer, sheet_name="Notas_formato", index=False)
+        for ws in writer.book.worksheets:
+            ws.freeze_panes = "A2"
+            for column_cells in ws.columns:
+                max_len = 10
+                for cell in column_cells[:150]:
+                    if cell.value is not None:
+                        max_len = max(max_len, len(str(cell.value)))
+                ws.column_dimensions[column_cells[0].column_letter].width = min(max_len + 2, 70)
+    return output.getvalue()
+
+
+def _safe_float(value, default=0.0):
     try:
-        if pd.isna(x):
+        if pd.isna(value):
             return default
-        if isinstance(x, str):
-            x = x.replace("COP", "").replace("$", "").replace(".", "").replace(",", ".")
-        return float(x)
+        return float(value)
     except Exception:
         return default
 
 
-def normalize_weights(series):
-    s = pd.to_numeric(series, errors="coerce").fillna(0.0)
-    total = s.sum()
-    if total <= 0:
-        return s
-    return s / total
-
-
-@st.cache_data
-def load_real_defaults(circles_file=None, params_file=None):
-    """Carga los Excel reales si existen. Si no, usa datos mínimos de ejemplo."""
-    # Círculos
-    if circles_file is not None:
-        circles_raw = pd.read_excel(circles_file)
-    elif os.path.exists(DEFAULT_CIRCLES_XLSX):
-        circles_raw = pd.read_excel(DEFAULT_CIRCLES_XLSX)
-    else:
-        circles_raw = pd.DataFrame({"ID": ["C1", "C2", "C3"], "Perimetro (m)": [120, 180, 250]})
-
-    circles = circles_raw.rename(columns={"ID": "circle_id", "Perimetro (m)": "perimeter_m"})
-    circles = circles[["circle_id", "perimeter_m"]].copy()
-    circles["circle_id"] = circles["circle_id"].astype(str).str.strip()
-    circles["perimeter_m"] = pd.to_numeric(circles["perimeter_m"], errors="coerce")
-    circles = circles.dropna(subset=["circle_id", "perimeter_m"])
-
-    # Parámetros
-    if params_file is not None:
-        params_raw = pd.read_excel(params_file, header=None)
-    elif os.path.exists(DEFAULT_PARAMS_XLSX):
-        params_raw = pd.read_excel(DEFAULT_PARAMS_XLSX, header=None)
-    else:
-        params_raw = pd.DataFrame()
-
-    def value_contains(text, fallback):
-        if params_raw.empty:
-            return fallback
-        mask = params_raw[0].astype(str).str.contains(text, case=False, na=False, regex=False)
-        if mask.any():
-            return _num(params_raw.loc[mask, 2].iloc[0], fallback)
-        return fallback
-
-    # Valores de costo con respaldo porque el archivo original contiene referencias externas.
-    budget = value_contains("Presupuesto Total Disponible", 446_852_500)
-    days = value_contains("Tiempo total disponible para el muestreo", 60)
-    hours_per_day = value_contains("Horas efectivas", 8)
-    max_teams = int(value_contains("Cantidad de equipos/sensores disponibles", 2))
-    daily_field_cost = value_contains("Logística de Muestreo", 1_513_000)
-    if daily_field_cost <= 0:
-        daily_field_cost = 1_513_000
-
-    # Separaciones permitidas. El archivo real no trae este conjunto, por eso queda editable.
-    separations = pd.DataFrame({"separation_m": [25.0, 50.0, 100.0, 200.0]})
-
-    # Estrategias de campo basadas en los tiempos y pesos AHP reales.
-    field = pd.DataFrame(
-        {
-            "field_code": ["STD", "ML", "M24", "EXT"],
-            "field_type": [
-                "Muestreo puntual estándar",
-                "Muestreo multinivel",
-                "Medición 24 horas",
-                "Medición extendida 5 días",
-            ],
-            "time_h_per_sample": [
-                value_contains("muestreo puntual estándar", 1),
-                value_contains("muestreo multinivel", 3),
-                value_contains("medición de 24 horas", 25),
-                value_contains("medición extendida", 121),
-            ],
-            "min_samples": [
-                value_contains("Candidatos de muestreo - Teledetección", 69),
-                value_contains("Puntos multinivel mínimos", 3),
-                value_contains("Mediciones de 24 horas mínimas", 10),
-                value_contains("Mediciones extendidas mínimas", 2),
-            ],
-            "ahp_weight_raw": [
-                value_contains("Calidad de un punto de muestreo estándar", 0.2417),
-                value_contains("Calidad de un punto multinivel", 0.2029),
-                value_contains("Calidad de una medición de 24 horas", 0.1459),
-                value_contains("Calidad de una medición extendida", 0.0523),
-            ],
-        }
+def _clean_name_series(series: pd.Series) -> pd.Series:
+    return (
+        series.astype("string")
+        .fillna("")
+        .str.strip()
+        .replace({"nan": "", "NaN": "", "None": "", "<NA>": ""})
     )
-    field["ahp_local_weight"] = normalize_weights(field["ahp_weight_raw"])
-
-    lab = pd.DataFrame(
-        {
-            "analysis_code": ["GC", "D", "HE", "MIN", "BIO"],
-            "analysis_type": [
-                "Cromatografía de gas",
-                "Isotopía de Deuterio",
-                "Isotopía de Helio",
-                "Caracterización mineralógica",
-                "Biogeoquímica",
-            ],
-            "unit_cost": [1_190_000, 5_724_852, 5_724_852, 1_228_080, 3_015_249.37],
-            "min_samples": [
-                value_contains("Muestras mínimas para cromatografia", 15),
-                value_contains("Muestras mínimas para isotopia de Deuterio", 5),
-                value_contains("Muestras mínimas para isotopia de Helio", 5),
-                value_contains("Muestras mínimas para caracterizacion mineralogica", 15),
-                value_contains("Muestras mínimas para biogeoquimica", 15),
-            ],
-            "max_samples": [1000, 1000, 1000, 1000, 1000],
-            "ahp_weight_raw": [
-                value_contains("Calidad de cromatografia", 0.1511),
-                value_contains("Calidad de isotopia de Deuterio", 0.0897),
-                value_contains("Calidad de isotopia de Helio", 0.0438),
-                value_contains("Calidad de caracterizacion mineralogica", 0.0399),
-                value_contains("Calidad de biogeoquimica", 0.0328),
-            ],
-        }
-    )
-    lab["ahp_local_weight"] = normalize_weights(lab["ahp_weight_raw"])
-
-    field_weight_raw = field["ahp_weight_raw"].sum()
-    lab_weight_raw = lab["ahp_weight_raw"].sum()
-    total_raw = field_weight_raw + lab_weight_raw
-    w_field = field_weight_raw / total_raw if total_raw > 0 else 0.6
-    w_lab = lab_weight_raw / total_raw if total_raw > 0 else 0.4
-
-    params = {
-        "budget": float(budget),
-        "days": float(days),
-        "hours_per_day": float(hours_per_day),
-        "daily_field_cost": float(daily_field_cost),
-        "max_teams": int(max_teams),
-        "w_field": float(w_field),
-        "w_lab": float(w_lab),
-    }
-    return circles, separations, field, lab, params
 
 
-def clean_inputs(circles, separations, field, lab):
+def _read_params(df: pd.DataFrame) -> Dict[str, float]:
+    if "Parametro" not in df.columns or "Valor" not in df.columns:
+        if len(df.columns) >= 4:
+            tmp = df.iloc[:, :4].copy()
+            tmp.columns = ["Parametro", "Descripcion", "Unidad", "Valor"]
+            df = tmp
+        else:
+            raise ValueError("La hoja Parametros debe contener las columnas Parametro y Valor.")
+    tmp = df[["Parametro", "Valor"]].dropna(subset=["Parametro"]).copy()
+    tmp["Parametro"] = _clean_name_series(tmp["Parametro"])
+    return dict(zip(tmp["Parametro"], tmp["Valor"]))
+
+
+def parse_excel(file_obj) -> ParsedData:
+    xls = pd.ExcelFile(file_obj)
+    sheet_map = {s.lower().strip(): s for s in xls.sheet_names}
+    required = {"parametros", "transectas", "separaciones", "campo", "laboratorio"}
+    if not required.issubset(set(sheet_map)):
+        raise ValueError("Formato no reconocido. Usa la plantilla con hojas: Parametros, Transectas, Separaciones, Campo y Laboratorio.")
+
+    params = _read_params(xls.parse(sheet_map["parametros"]))
+
+    circles = xls.parse(sheet_map["transectas"])
+    circles = circles.iloc[:, :2].copy()
+    circles.columns = ["ID", "Longitud_m"]
+
+    separations = xls.parse(sheet_map["separaciones"])
+    separations = separations.iloc[:, :1].copy()
+    separations.columns = ["separacion_m"]
+
+    field_df = xls.parse(sheet_map["campo"])
+    if len(field_df.columns) < 6:
+        raise ValueError("La hoja Campo debe tener columnas: actividad, alpha_f, t_Dia_h, t_Noche_h, c_h_Dia_COP_h, c_h_Noche_COP_h.")
+    field_df = field_df.iloc[:, :6].copy()
+    field_df.columns = ["actividad", "alpha_f", "t_Dia_h", "t_Noche_h", "c_h_Dia_COP_h", "c_h_Noche_COP_h"]
+
+    lab_df = xls.parse(sheet_map["laboratorio"])
+    if len(lab_df.columns) < 3:
+        raise ValueError("La hoja Laboratorio debe tener columnas: analisis, gamma_k, c_lab_COP_muestra.")
+    lab_df = lab_df.iloc[:, :3].copy()
+    lab_df.columns = ["analisis", "gamma_k", "c_lab_COP_muestra"]
+
+    return ParsedData(params=params, circles=circles, separations=separations, field_df=field_df, lab_df=lab_df)
+
+
+def clean_model_inputs(
+    circles: pd.DataFrame,
+    separations: pd.DataFrame,
+    field_df: pd.DataFrame,
+    lab_df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, List[int], pd.DataFrame, pd.DataFrame]:
     circles = circles.copy()
     separations = separations.copy()
-    field = field.copy()
-    lab = lab.copy()
+    field_df = field_df.copy()
+    lab_df = lab_df.copy()
 
-    circles["circle_id"] = circles["circle_id"].astype(str).str.strip()
-    field["field_code"] = field["field_code"].astype(str).str.strip()
-    field["field_type"] = field["field_type"].astype(str).str.strip()
-    lab["analysis_code"] = lab["analysis_code"].astype(str).str.strip()
-    lab["analysis_type"] = lab["analysis_type"].astype(str).str.strip()
+    # Compatibilidad con plantillas históricas.
+    if "Longitud_m" not in circles.columns and "Radio_m" in circles.columns:
+        circles = circles.rename(columns={"Radio_m": "Longitud_m"})
+    if "Longitud_m" not in circles.columns and "Perimetro_m" in circles.columns:
+        circles = circles.rename(columns={"Perimetro_m": "Longitud_m"})
+    if "ID" not in circles.columns or "Longitud_m" not in circles.columns:
+        raise ValueError("La tabla de transectas debe contener ID y Longitud_m.")
+    circles["ID"] = _clean_name_series(circles["ID"])
+    circles["Longitud_m"] = pd.to_numeric(circles["Longitud_m"], errors="coerce")
+    circles = circles[(circles["ID"] != "") & circles["Longitud_m"].notna() & (circles["Longitud_m"] > 0)]
+    circles = circles.drop_duplicates(subset=["ID"], keep="first").reset_index(drop=True)
 
-    circles["perimeter_m"] = pd.to_numeric(circles["perimeter_m"], errors="coerce")
-    separations["separation_m"] = pd.to_numeric(separations["separation_m"], errors="coerce")
-    for col in ["time_h_per_sample", "min_samples", "ahp_weight_raw"]:
-        field[col] = pd.to_numeric(field[col], errors="coerce").fillna(0)
-    for col in ["unit_cost", "min_samples", "max_samples", "ahp_weight_raw"]:
-        lab[col] = pd.to_numeric(lab[col], errors="coerce").fillna(0)
+    if "separacion_m" not in separations.columns:
+        raise ValueError("La tabla de separaciones debe contener separacion_m.")
+    sep = pd.to_numeric(separations["separacion_m"], errors="coerce").dropna()
+    sep = sorted(set(int(round(x)) for x in sep if x > 0))
 
-    field["ahp_local_weight"] = normalize_weights(field["ahp_weight_raw"])
-    lab["ahp_local_weight"] = normalize_weights(lab["ahp_weight_raw"])
+    required_field = ["actividad", "alpha_f", "t_Dia_h", "t_Noche_h", "c_h_Dia_COP_h", "c_h_Noche_COP_h"]
+    for col in required_field:
+        if col not in field_df.columns:
+            raise ValueError(f"La tabla Campo debe contener la columna {col}.")
+    field_df["actividad"] = _clean_name_series(field_df["actividad"])
+    field_df = field_df[field_df["actividad"] != ""].copy()
+    for col in ["alpha_f", "t_Dia_h", "t_Noche_h", "c_h_Dia_COP_h", "c_h_Noche_COP_h"]:
+        field_df[col] = pd.to_numeric(field_df[col], errors="coerce").fillna(0)
+    field_df = field_df[(field_df["t_Dia_h"] + field_df["t_Noche_h"]) > 0].reset_index(drop=True)
 
-    circles = circles.dropna(subset=["circle_id", "perimeter_m"])
-    circles = circles[circles["perimeter_m"] > 0]
-    separations = separations.dropna(subset=["separation_m"])
-    separations = separations[separations["separation_m"] > 0]
-    field = field[(field["field_code"] != "") & (field["time_h_per_sample"] > 0)]
-    lab = lab[(lab["analysis_code"] != "") & (lab["unit_cost"] >= 0) & (lab["max_samples"] >= lab["min_samples"])]
+    required_lab = ["analisis", "gamma_k", "c_lab_COP_muestra"]
+    for col in required_lab:
+        if col not in lab_df.columns:
+            raise ValueError(f"La tabla Laboratorio debe contener la columna {col}.")
+    lab_df["analisis"] = _clean_name_series(lab_df["analisis"])
+    lab_df = lab_df[lab_df["analisis"] != ""].copy()
+    for col in ["gamma_k", "c_lab_COP_muestra"]:
+        lab_df[col] = pd.to_numeric(lab_df[col], errors="coerce").fillna(0)
+    lab_df = lab_df[lab_df["c_lab_COP_muestra"] >= 0].reset_index(drop=True)
 
-    if circles.empty or separations.empty or field.empty or lab.empty:
-        raise ValueError("Revisa los datos: no puede haber tablas vacías ni valores negativos/incorrectos.")
-    if field["ahp_local_weight"].sum() <= 0 or lab["ahp_local_weight"].sum() <= 0:
-        raise ValueError("Los pesos AHP deben sumar más que cero.")
-    if circles["circle_id"].duplicated().any():
-        raise ValueError("Los IDs de círculos deben ser únicos.")
-    if field["field_code"].duplicated().any() or lab["analysis_code"].duplicated().any():
-        raise ValueError("Los códigos de campo y laboratorio deben ser únicos.")
-
-    return circles, separations, field, lab
-
-
-def build_model(circles, separations, field, lab, params):
-    circle_ids = circles["circle_id"].tolist()
-    sep_vals = separations["separation_m"].tolist()
-    field_codes = field["field_code"].tolist()
-    lab_codes = lab["analysis_code"].tolist()
-
-    field_name = dict(zip(field["field_code"], field["field_type"]))
-    lab_name = dict(zip(lab["analysis_code"], lab["analysis_type"]))
-
-    P = dict(zip(circles["circle_id"], circles["perimeter_m"]))
-    n_points = {(i, s): int(math.ceil(P[i] / s)) for i in circle_ids for s in sep_vals}
-    t = dict(zip(field["field_code"], field["time_h_per_sample"]))
-    wf = dict(zip(field["field_code"], field["ahp_local_weight"]))
-    min_field = dict(zip(field["field_code"], field["min_samples"]))
-    ca = dict(zip(lab["analysis_code"], lab["unit_cost"]))
-    wa = dict(zip(lab["analysis_code"], lab["ahp_local_weight"]))
-    min_lab = dict(zip(lab["analysis_code"], lab["min_samples"]))
-    max_lab = dict(zip(lab["analysis_code"], lab["max_samples"]))
-
-    B = float(params["budget"])
-    D = float(params["days"])
-    H = float(params["hours_per_day"])
-    c_day = float(params["daily_field_cost"])
-    max_teams = int(params["max_teams"])
-    W_field = float(params["w_field"])
-    W_lab = float(params["w_lab"])
-    couple_lab_to_field = bool(params.get("couple_lab_to_field", True))
-    c_hour = c_day / H
-
-    m = pulp.LpProblem("MILP_AHP_Goal_Programming", pulp.LpMinimize)
-
-    y = pulp.LpVariable.dicts("activate", (circle_ids, field_codes), cat="Binary")
-    x = pulp.LpVariable.dicts("sep_choice", (circle_ids, field_codes, sep_vals), cat="Binary")
-    q_lab = pulp.LpVariable.dicts("lab_samples", lab_codes, lowBound=0, cat="Integer")
-    teams = pulp.LpVariable("teams", lowBound=1, upBound=max_teams, cat="Integer")
-
-    g_field = pulp.LpVariable.dicts("field_cost", field_codes, lowBound=0, cat="Continuous")
-    g_lab = pulp.LpVariable.dicts("lab_cost", lab_codes, lowBound=0, cat="Continuous")
-    total_used = pulp.LpVariable("total_budget_used", lowBound=0, cat="Continuous")
-    total_field = pulp.LpVariable("total_field_cost", lowBound=0, cat="Continuous")
-    total_lab = pulp.LpVariable("total_lab_cost", lowBound=0, cat="Continuous")
-
-    dev_block_field = pulp.LpVariable("dev_block_field", lowBound=0, cat="Continuous")
-    dev_block_lab = pulp.LpVariable("dev_block_lab", lowBound=0, cat="Continuous")
-    dev_field = pulp.LpVariable.dicts("dev_field", field_codes, lowBound=0, cat="Continuous")
-    dev_lab = pulp.LpVariable.dicts("dev_lab", lab_codes, lowBound=0, cat="Continuous")
-
-    for i in circle_ids:
-        safe_i = re.sub(r"\W+", "_", str(i))
-        m += pulp.lpSum(y[i][k] for k in field_codes) >= 1, f"at_least_one_activity_{safe_i}"
-        for k in field_codes:
-            m += pulp.lpSum(x[i][k][s] for s in sep_vals) == y[i][k], f"one_sep_if_active_{safe_i}_{k}"
-
-    field_qty_expr = {}
-    for k in field_codes:
-        field_qty_expr[k] = pulp.lpSum(n_points[(i, s)] * x[i][k][s] for i in circle_ids for s in sep_vals)
-        m += field_qty_expr[k] >= min_field[k], f"min_field_{k}"
-        m += g_field[k] == c_hour * t[k] * field_qty_expr[k], f"field_cost_{k}"
-
-    total_field_samples = pulp.lpSum(field_qty_expr[k] for k in field_codes)
-
-    for a in lab_codes:
-        m += q_lab[a] >= min_lab[a], f"min_lab_samples_{a}"
-        m += q_lab[a] <= max_lab[a], f"max_lab_samples_{a}"
-        if couple_lab_to_field:
-            m += q_lab[a] <= total_field_samples, f"lab_coupled_to_field_{a}"
-        m += g_lab[a] == ca[a] * q_lab[a], f"lab_cost_{a}"
-
-    m += total_field == pulp.lpSum(g_field[k] for k in field_codes), "total_field"
-    m += total_lab == pulp.lpSum(g_lab[a] for a in lab_codes), "total_lab"
-    m += total_used == total_field + total_lab, "total_used"
-    m += total_used <= B, "budget_limit"
-
-    total_time = pulp.lpSum(t[k] * field_qty_expr[k] for k in field_codes)
-    m += total_time <= D * H * teams, "time_capacity"
-
-    m += total_field - W_field * total_used <= dev_block_field, "block_field_pos"
-    m += W_field * total_used - total_field <= dev_block_field, "block_field_neg"
-    m += total_lab - W_lab * total_used <= dev_block_lab, "block_lab_pos"
-    m += W_lab * total_used - total_lab <= dev_block_lab, "block_lab_neg"
-
-    for k in field_codes:
-        m += g_field[k] - wf[k] * total_field <= dev_field[k], f"field_dev_pos_{k}"
-        m += wf[k] * total_field - g_field[k] <= dev_field[k], f"field_dev_neg_{k}"
-
-    for a in lab_codes:
-        m += g_lab[a] - wa[a] * total_lab <= dev_lab[a], f"lab_dev_pos_{a}"
-        m += wa[a] * total_lab - g_lab[a] <= dev_lab[a], f"lab_dev_neg_{a}"
-
-    return {
-        "model": m,
-        "sets": (circle_ids, sep_vals, field_codes, lab_codes),
-        "names": {"field": field_name, "lab": lab_name},
-        "vars": {
-            "x": x,
-            "y": y,
-            "q_lab": q_lab,
-            "teams": teams,
-            "g_field": g_field,
-            "g_lab": g_lab,
-            "total_used": total_used,
-            "total_field": total_field,
-            "total_lab": total_lab,
-            "dev_block_field": dev_block_field,
-            "dev_block_lab": dev_block_lab,
-            "dev_field": dev_field,
-            "dev_lab": dev_lab,
-        },
-        "n_points": n_points,
-        "field_qty_expr": field_qty_expr,
-        "total_field_samples": total_field_samples,
-        "total_time_expr": total_time,
-    }
+    if circles.empty:
+        raise ValueError("No hay transectas válidos.")
+    if not sep:
+        raise ValueError("Debes introducir al menos una separación positiva.")
+    if field_df.empty:
+        raise ValueError("No hay actividades de campo válidas.")
+    if lab_df.empty:
+        raise ValueError("No hay análisis de laboratorio válidos.")
+    if field_df["alpha_f"].sum() <= 0:
+        raise ValueError("La suma de alpha_f debe ser mayor que cero.")
+    if lab_df["gamma_k"].sum() <= 0:
+        raise ValueError("La suma de gamma_k debe ser mayor que cero.")
+    return circles, sep, field_df, lab_df
 
 
-def solve_relaxed_minimums(circles, separations, field, lab, params, time_limit_sec=30):
-    """Calcula mínimos auxiliares relajando presupuesto y capacidad de tiempo.
+def validate_weight_sum(name: str, value: float, tolerance: float = 0.02):
+    if abs(float(value) - 1.0) > tolerance:
+        raise ValueError(f"Según la formulación, {name} debe sumar 1. Valor actual: {value:.4f}.")
 
-    Sirve para explicar por qué algunas separaciones vuelven infactible el modelo.
-    No reemplaza la optimización lexicográfica final.
+
+def compute_n_points(length: float, separation: int) -> int:
+    """Calcula n_i,s según el modelo final: max(1, floor(L_i / s) + 1).
+
+    L_i representa la longitud total de la transecta.
+    El +1 cuenta ambos extremos del transecto cuando se discretiza con separación s.
     """
-    relaxed_params = dict(params)
-    relaxed_params["budget"] = 1e15
-    relaxed_params["days"] = 1e9
-
-    objects_time = build_model(circles, separations, field, lab, relaxed_params)
-    m_time = objects_time["model"]
-    m_time.sense = pulp.LpMinimize
-    m_time.setObjective(objects_time["total_time_expr"])
-    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit_sec)
-    status_time = m_time.solve(solver)
-    min_time = None
-    if pulp.LpStatus[status_time] == "Optimal":
-        min_time = float(pulp.value(objects_time["total_time_expr"]))
-
-    objects_cost = build_model(circles, separations, field, lab, relaxed_params)
-    m_cost = objects_cost["model"]
-    m_cost.sense = pulp.LpMinimize
-    m_cost.setObjective(objects_cost["vars"]["total_used"])
-    status_cost = m_cost.solve(solver)
-    min_cost = None
-    if pulp.LpStatus[status_cost] == "Optimal":
-        min_cost = float(pulp.value(objects_cost["vars"]["total_used"]))
-
-    return {
-        "status_time": pulp.LpStatus[status_time],
-        "min_time_h": min_time,
-        "status_cost": pulp.LpStatus[status_cost],
-        "min_cost": min_cost,
-    }
+    if separation <= 0:
+        raise ValueError("Todas las separaciones deben ser mayores que cero.")
+    if not math.isfinite(float(length)) or length <= 0:
+        raise ValueError(f"Longitud de transecta inválida: {length}.")
+    return max(1, int(math.floor(float(length) / int(separation))) + 1)
 
 
-def solve_lexicographic(objects, time_limit_sec=60):
-    m = objects["model"]
-    _, _, field_codes, lab_codes = objects["sets"]
-    v = objects["vars"]
-    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit_sec)
-    # Tolerancia lexicográfica en COP.
-    # Usar 1e-5 COP es demasiado estricto para un MILP con costos grandes
-    # e integridad/discretización; CBC puede declarar infeasible por tolerancias numéricas.
-    def lex_tol(value):
-        return max(1000.0, 1e-6 * abs(float(value)))
-
-    z1_expr = v["dev_block_field"] + v["dev_block_lab"]
-    m.sense = pulp.LpMinimize
-    m.setObjective(z1_expr)
-    status1 = m.solve(solver)
-    if pulp.LpStatus[status1] != "Optimal":
-        raise RuntimeError(f"Etapa 1 no factible u óptimo no encontrado: {pulp.LpStatus[status1]}")
-    z1 = pulp.value(z1_expr)
-    m += z1_expr <= z1 + lex_tol(z1), "fix_Z1"
-
-    z2_expr = pulp.lpSum(v["dev_field"][k] for k in field_codes) + pulp.lpSum(v["dev_lab"][a] for a in lab_codes)
-    m.sense = pulp.LpMinimize
-    m.setObjective(z2_expr)
-    status2 = m.solve(solver)
-    if pulp.LpStatus[status2] != "Optimal":
-        raise RuntimeError(f"Etapa 2 no factible u óptimo no encontrado: {pulp.LpStatus[status2]}")
-    z2 = pulp.value(z2_expr)
-    m += z2_expr <= z2 + lex_tol(z2), "fix_Z2"
-
-    m.sense = pulp.LpMaximize
-    m.setObjective(v["total_used"])
-    status3 = m.solve(solver)
-    if pulp.LpStatus[status3] != "Optimal":
-        raise RuntimeError(f"Etapa 3 no factible u óptimo no encontrado: {pulp.LpStatus[status3]}")
-
-    return {
-        "status": pulp.LpStatus[status3],
-        "z1": float(z1),
-        "z2": float(z2),
-        "objective_budget_used": float(pulp.value(v["total_used"])),
-    }
+def find_puntual_activity(field_df: pd.DataFrame, preferred_name=None) -> str:
+    activities = field_df["actividad"].tolist()
+    if preferred_name:
+        preferred = str(preferred_name).strip()
+        for a in activities:
+            if str(a).strip().lower() == preferred.lower():
+                return a
+    for a in activities:
+        if "puntual" in str(a).lower():
+            return a
+    return activities[0]
 
 
-def extract_results(objects):
-    circle_ids, sep_vals, field_codes, lab_codes = objects["sets"]
-    names = objects["names"]
-    v = objects["vars"]
-    n_points = objects["n_points"]
-
-    rows = []
-    for i in circle_ids:
-        for k in field_codes:
-            if pulp.value(v["y"][i][k]) and pulp.value(v["y"][i][k]) > 0.5:
-                chosen_sep = None
-                chosen_points = None
-                for s in sep_vals:
-                    if pulp.value(v["x"][i][k][s]) and pulp.value(v["x"][i][k][s]) > 0.5:
-                        chosen_sep = s
-                        chosen_points = n_points[(i, s)]
-                        break
-                rows.append(
-                    {
-                        "circle_id": i,
-                        "field_code": k,
-                        "field_type": names["field"][k],
-                        "separation_m": chosen_sep,
-                        "n_points": chosen_points,
-                    }
-                )
-    field_plan = pd.DataFrame(rows)
-
-    field_costs = pd.DataFrame(
-        {
-            "field_code": field_codes,
-            "field_type": [names["field"][k] for k in field_codes],
-            "field_samples": [round(pulp.value(objects["field_qty_expr"][k])) for k in field_codes],
-            "field_cost": [pulp.value(v["g_field"][k]) for k in field_codes],
-            "field_deviation": [pulp.value(v["dev_field"][k]) for k in field_codes],
-        }
-    )
-    lab_plan = pd.DataFrame(
-        {
-            "analysis_code": lab_codes,
-            "analysis_type": [names["lab"][a] for a in lab_codes],
-            "lab_samples": [int(round(pulp.value(v["q_lab"][a]))) for a in lab_codes],
-            "lab_cost": [pulp.value(v["g_lab"][a]) for a in lab_codes],
-            "lab_deviation": [pulp.value(v["dev_lab"][a]) for a in lab_codes],
-        }
-    )
-    summary = pd.DataFrame(
-        {
-            "metric": [
-                "Equipos seleccionados",
-                "Gasto total usado",
-                "Gasto campo",
-                "Gasto laboratorio",
-                "Muestras/puntos de campo",
-                "Desviación bloque campo",
-                "Desviación bloque laboratorio",
-            ],
-            "value": [
-                pulp.value(v["teams"]),
-                pulp.value(v["total_used"]),
-                pulp.value(v["total_field"]),
-                pulp.value(v["total_lab"]),
-                pulp.value(objects["total_field_samples"]),
-                pulp.value(v["dev_block_field"]),
-                pulp.value(v["dev_block_lab"]),
-            ],
-        }
-    )
-    return summary, field_plan, field_costs, lab_plan
+INVALID_SHEET_CHARS = str.maketrans({c: "_" for c in '[]:*?/\\'})
 
 
-def to_excel(sheets):
-    output = BytesIO()
+def safe_sheet_name(name: str, prefix: str = "", used=None) -> str:
+    used = used if used is not None else set()
+    base = f"{prefix}{name}".translate(INVALID_SHEET_CHARS).strip()
+    base = "_".join(base.split()) or "Hoja"
+    base = base[:31]
+    candidate = base
+    counter = 2
+    while candidate in used:
+        suffix = f"_{counter}"
+        candidate = f"{base[:31-len(suffix)]}{suffix}"
+        counter += 1
+    used.add(candidate)
+    return candidate
+
+
+def _integer_proportional_allocation(total: int, capacities: pd.Series) -> pd.Series:
+    total = int(total)
+    capacities = pd.to_numeric(capacities, errors="coerce").fillna(0).astype(float)
+    result = pd.Series([0] * len(capacities), index=capacities.index, dtype=int)
+    if total <= 0 or capacities.sum() <= 0:
+        return result
+    raw = capacities / capacities.sum() * total
+    base = raw.apply(math.floor).astype(int)
+    remainder = total - int(base.sum())
+    if remainder > 0:
+        order = (raw - base).sort_values(ascending=False).index[:remainder]
+        base.loc[order] += 1
+    return base.astype(int)
+
+
+def build_lab_allocation_by_circle(plan_df: pd.DataFrame, lab_result_df: pd.DataFrame, lab_input_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if plan_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    base_plan = plan_df[plan_df.get("tipo_resultado", "") == "puntual_por_transecta"].copy()
+    if base_plan.empty:
+        base_plan = plan_df[plan_df["transecta"].astype(str) != "GLOBAL"].copy()
+    if base_plan.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    all_circles = base_plan[["transecta", "longitud_m"]].drop_duplicates().sort_values("transecta").reset_index(drop=True)
+    capacity = base_plan.groupby("transecta", as_index=True)["puntos"].sum().rename("muestras_puntuales_base")
+    wide = all_circles.merge(capacity, left_on="transecta", right_index=True, how="left")
+    wide["muestras_puntuales_base"] = pd.to_numeric(wide["muestras_puntuales_base"], errors="coerce").fillna(0).astype(int)
+
+    lab_costs = lab_input_df[["analisis", "c_lab_COP_muestra"]].copy()
+    lab_counts = lab_result_df[["analisis", "muestras_L"]].merge(lab_costs, on="analisis", how="left")
+    long_rows = []
+    for _, lab_row in lab_counts.iterrows():
+        analysis = lab_row["analisis"]
+        total_samples = int(lab_row["muestras_L"])
+        cost_per_sample = _safe_float(lab_row.get("c_lab_COP_muestra"), 0)
+        allocation = _integer_proportional_allocation(total_samples, wide["muestras_puntuales_base"])
+        wide[analysis] = allocation.values
+        for idx, alloc in allocation.items():
+            long_rows.append({
+                "transecta": wide.loc[idx, "transecta"],
+                "longitud_m": wide.loc[idx, "longitud_m"],
+                "muestras_puntuales_base": int(wide.loc[idx, "muestras_puntuales_base"]),
+                "analisis": analysis,
+                "muestras_asignadas_sugeridas": int(alloc),
+                "costo_estimado_COP": int(round(int(alloc) * cost_per_sample)),
+            })
+    lab_cols = [c for c in wide.columns if c not in ["transecta", "longitud_m", "muestras_puntuales_base"]]
+    wide["analisis_totales_asignados"] = wide[lab_cols].sum(axis=1) if lab_cols else 0
+    long_df = pd.DataFrame(long_rows)
+    if not long_df.empty:
+        long_df = long_df.sort_values(["transecta", "analisis"]).reset_index(drop=True)
+    return wide, long_df
+
+
+def model_equations_table() -> pd.DataFrame:
+    rows = [
+        ("Conjuntos", "I, S, F, K, W={Dia,Noche}; F = {Puntual, 24h, Largo, Multinivel}"),
+        ("Puntos puntuales", "n_i,s = max(1, floor(L_i / s) + 1)"),
+        ("Selección única por transecta", "sum_s y_i,s = 1  para todo i"),
+        ("Muestras puntuales", "Q_puntual = sum_i sum_s n_i,s * y_i,s"),
+        ("Saturación operativa por transecta", "N_min <= sum_s n_i,s * y_i,s <= N_max  para todo i"),
+        ("Techo físico especializado", "Q_f <= Q_puntual para todo f != puntual"),
+        ("Cotas mínimas campo", "Q_f >= 1 si alpha_f > 0"),
+        ("Cotas mínimas laboratorio", "L_k >= 1 si gamma_k > 0"),
+        ("Costo campo", "C_f = Q_f * sum_w c_h,f,w * t_f,w"),
+        ("Costo lab", "C_k = c_lab,k * L_k"),
+        ("Agregados", "C_field=sum_f C_f; C_lab=sum_k C_k; C_used=C_field+C_lab"),
+        ("Presupuesto", "C_used <= C_total"),
+        ("Capacidad", "sum_f t_f,w * Q_f <= E_w * T_max * H_turno  para todo w"),
+        ("Equipos", "E_w <= E_max  para todo w"),
+        ("Conservación", "sum_k L_k <= sum_f Q_f"),
+        ("AHP global", "C_field+eF- - eF+ = beta_F*C_used; C_lab+eL- - eL+ = beta_L*C_used"),
+        ("AHP campo", "C_f+d_f- - d_f+ = alpha_f*C_field"),
+        ("AHP lab", "C_k+u_k- - u_k+ = gamma_k*C_lab"),
+        ("Etapa 1", "min Z1 = eF-+eF+ + eL-+eL+"),
+        ("Etapa 2", "min Z2 = sum_f(d_f-+d_f+) + sum_k(u_k-+u_k+) sujeto a Z1 <= Z1* + epsilon"),
+        ("Etapa 3", "max C_used sujeto a Z1 <= Z1* + epsilon y Z2 <= Z2* + epsilon"),
+    ]
+    return pd.DataFrame(rows, columns=["Bloque", "Ecuación implementada"])
+
+
+def build_excel_report(result: Dict, lab_input_df: pd.DataFrame, params_used: Dict) -> bytes:
+    output = io.BytesIO()
+    used_sheets = set()
+    kpis = result.get("kpis", {})
+    summary = pd.DataFrame([{"Indicador": k, "Valor": v} for k, v in kpis.items()])
+    plan = result.get("plan", pd.DataFrame()).copy()
+    field = result.get("field", pd.DataFrame()).copy()
+    lab = result.get("lab", pd.DataFrame()).copy()
+    logs = pd.DataFrame(result.get("logs", []))
+    lab_by_circle, lab_long = build_lab_allocation_by_circle(plan, lab, lab_input_df)
+    params_df = pd.DataFrame([{"Parametro": k, "Valor": v} for k, v in params_used.items()])
+    equations = model_equations_table()
+
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for name, df in sheets.items():
-            df.to_excel(writer, index=False, sheet_name=name[:31])
-    output.seek(0)
-    return output
+        sheet = safe_sheet_name("Resumen", used=used_sheets)
+        summary.to_excel(writer, sheet_name=sheet, index=False, startrow=0)
+        field.to_excel(writer, sheet_name=sheet, index=False, startrow=len(summary) + 3)
+        lab.to_excel(writer, sheet_name=sheet, index=False, startrow=len(summary) + len(field) + 6)
+        for name, df in [
+            ("Parametros_usados", params_df),
+            ("Modelo_usado", equations),
+            ("Plan_completo", plan),
+            ("Campo_resumen", field),
+            ("Laboratorio_resumen", lab),
+            ("Lab_por_transecta", lab_by_circle),
+            ("Lab_detalle_transecta", lab_long),
+        ]:
+            sheet = safe_sheet_name(name, used=used_sheets)
+            df.to_excel(writer, sheet_name=sheet, index=False)
+        if not plan.empty and "actividad" in plan.columns:
+            for activity in sorted(plan["actividad"].dropna().unique()):
+                filtered = plan[plan["actividad"] == activity].copy()
+                sheet = safe_sheet_name(str(activity), prefix="Campo_", used=used_sheets)
+                filtered.to_excel(writer, sheet_name=sheet, index=False)
+        if not lab_long.empty and "analisis" in lab_long.columns:
+            for analysis in sorted(lab_long["analisis"].dropna().unique()):
+                filtered = lab_long[lab_long["analisis"] == analysis].copy()
+                sheet = safe_sheet_name(str(analysis), prefix="Lab_", used=used_sheets)
+                filtered.to_excel(writer, sheet_name=sheet, index=False)
+        sheet = safe_sheet_name("Log_solver", used=used_sheets)
+        logs.to_excel(writer, sheet_name=sheet, index=False)
+        for ws in writer.book.worksheets:
+            ws.freeze_panes = "A2"
+            for col_cells in ws.columns:
+                header = col_cells[0].value if col_cells else ""
+                max_len = len(str(header)) if header is not None else 0
+                for cell in col_cells[:250]:
+                    if cell.value is not None:
+                        max_len = max(max_len, len(str(cell.value)))
+                ws.column_dimensions[col_cells[0].column_letter].width = min(max(max_len + 2, 10), 60)
+    return output.getvalue()
 
 
-def money(x):
-    return f"COP {x:,.0f}"
+def solve_milp_ahp_modified(
+    circles: pd.DataFrame,
+    separations: List[int],
+    field_df: pd.DataFrame,
+    lab_df: pd.DataFrame,
+    budget_cop: int,
+    days_available: int,
+    hours_per_shift: int,
+    max_teams: int,
+    beta_field: float,
+    beta_lab: float,
+    time_limit_per_stage: int,
+    actividad_puntual_base=None,
+    n_min: int = DEFAULT_N_MIN,
+    n_max: int = DEFAULT_N_MAX,
+) -> Dict:
+    circles, separations, field_df, lab_df = clean_model_inputs(circles, pd.DataFrame({"separacion_m": separations}), field_df, lab_df)
+    n_min = int(round(float(n_min)))
+    n_max = int(round(float(n_max)))
+    if n_min < 1:
+        raise ValueError("N_min debe ser mayor o igual a 1.")
+    if n_max < n_min:
+        raise ValueError("N_max debe ser mayor o igual a N_min.")
+
+    validate_weight_sum("beta_F + beta_L", beta_field + beta_lab)
+    validate_weight_sum("sum_f alpha_f", float(field_df["alpha_f"].sum()))
+    validate_weight_sum("sum_k gamma_k", float(lab_df["gamma_k"].sum()))
+
+    I = circles["ID"].tolist()
+    F = field_df["actividad"].tolist()
+    K = lab_df["analisis"].tolist()
+    W = SHIFTS
+    puntual = find_puntual_activity(field_df, actividad_puntual_base)
+    specialized = [f for f in F if f != puntual]
+    length = dict(zip(I, circles["Longitud_m"].astype(float)))
+
+    budget = int(round(budget_cop))
+    beta = {"Campo": int(round(beta_field * W_SCALE)), "Laboratorio": int(round(beta_lab * W_SCALE))}
+    alpha = {row["actividad"]: int(round(row["alpha_f"] * W_SCALE)) for _, row in field_df.iterrows()}
+    gamma = {row["analisis"]: int(round(row["gamma_k"] * W_SCALE)) for _, row in lab_df.iterrows()}
+
+    t, c_h = {}, {}
+    for _, row in field_df.iterrows():
+        f = row["actividad"]
+        t[(f, "Dia")] = int(round(float(row["t_Dia_h"])))
+        t[(f, "Noche")] = int(round(float(row["t_Noche_h"])))
+        c_h[(f, "Dia")] = int(round(float(row["c_h_Dia_COP_h"])))
+        c_h[(f, "Noche")] = int(round(float(row["c_h_Noche_COP_h"])))
+    lab_cost = dict(zip(K, lab_df["c_lab_COP_muestra"].round().astype(int)))
+    n = {(i, s): compute_n_points(length[i], s) for i in I for s in separations}
+
+    infeasible_saturation = []
+    for i in I:
+        feasible_s = [s for s in separations if n_min <= n[(i, s)] <= n_max]
+        if not feasible_s:
+            infeasible_saturation.append({
+                "transecta": i,
+                "longitud_m": length[i],
+                "puntos_por_separacion": ", ".join(f"{s} m: {n[(i, s)]}" for s in separations),
+                "N_min": n_min,
+                "N_max": n_max,
+            })
+    if infeasible_saturation:
+        return {
+            "ok": False,
+            "logs": [{"etapa": "Prevalidación saturación operativa", "estado": "INFEASIBLE"}],
+            "error": "No se encontró solución factible: al menos un transecta no tiene ninguna separación que cumpla N_min <= puntos_i <= N_max.",
+            "diagnostico_saturacion": pd.DataFrame(infeasible_saturation),
+        }
+
+    max_puntual = sum(max(n[(i, s)] for s in separations if n_min <= n[(i, s)] <= n_max) for i in I)
+    model = cp_model.CpModel()
+
+    y = {(i, s): model.NewBoolVar(f"y_sep__{i}__{s}") for i in I for s in separations}
+    Q = {f: model.NewIntVar(0, max_puntual, f"Q__{f}") for f in F}
+    Cf = {f: model.NewIntVar(0, budget, f"Cf__{f}") for f in F}
+
+    min_lab_cost = max(1, min([v for v in lab_cost.values() if v > 0] or [1]))
+    lab_upper_bound = int(budget / min_lab_cost) + max_puntual + 100
+    L = {k: model.NewIntVar(0, lab_upper_bound, f"L__{k}") for k in K}
+    Ck = {k: model.NewIntVar(0, budget, f"Ck__{k}") for k in K}
+    E = {w: model.NewIntVar(0, max_teams, f"E__{w}") for w in W}
+    Cfield = model.NewIntVar(0, budget, "Cfield")
+    Clab = model.NewIntVar(0, budget, "Clab")
+    Cused = model.NewIntVar(0, budget, "Cused")
+
+    # 4.1.1 Selección única por transecta para muestreo puntual
+    for i in I:
+        model.Add(sum(y[(i, s)] for s in separations) == 1)
+
+    # 4.1.3 Restricción de saturación operativa por transecta
+    # Impide sub-muestreo y sobre-muestreo en cada transecta.
+    for i in I:
+        points_i = sum(n[(i, s)] * y[(i, s)] for s in separations)
+        model.Add(points_i >= n_min)
+        model.Add(points_i <= n_max)
+
+    # 4.1.2 Cantidad total de muestras puntuales
+    model.Add(Q[puntual] == sum(n[(i, s)] * y[(i, s)] for i in I for s in separations))
+
+    # 4.2.1 Acoplamiento lógico / techo físico
+    for f in specialized:
+        model.Add(Q[f] <= Q[puntual])
+
+    # 4.5.2 Cotas mínimas: no abandonar técnicas/análisis con peso AHP > 0
+    for f in F:
+        if alpha[f] > 0:
+            model.Add(Q[f] >= 1)
+    for k in K:
+        if gamma[k] > 0:
+            model.Add(L[k] >= 1)
+
+    # 4.3.1 Costos de campo
+    for f in F:
+        cost_per_unit_base = sum(c_h[(f, w)] * t[(f, w)] for w in W)
+        cost_per_unit = int(round(cost_per_unit_base))
+        model.Add(Cf[f] == cost_per_unit * Q[f])
+
+    # 4.3.2 Costos laboratorio
+    for k in K:
+        model.Add(Ck[k] == lab_cost[k] * L[k])
+
+    # 4.3.3, 4.3.4 Agregados y presupuesto
+    model.Add(Cfield == sum(Cf[f] for f in F))
+    model.Add(Clab == sum(Ck[k] for k in K))
+    model.Add(Cused == Cfield + Clab)
+    model.Add(Cused <= budget)
+
+    # 4.2.2 Capacidad operativa por turno
+    for w in W:
+        model.Add(sum(t[(f, w)] * Q[f] for f in F) <= E[w] * int(days_available) * int(hours_per_shift))
+        model.Add(E[w] <= int(max_teams))
+
+    # 4.5.1 Conservación de muestras
+    total_field_samples = sum(Q[f] for f in F)
+    model.Add(sum(L[k] for k in K) <= total_field_samples)
+
+    # 4.4 AHP
+    max_dev = max(1, budget * W_SCALE)
+    eF_minus = model.NewIntVar(0, max_dev, "eF_minus")
+    eF_plus = model.NewIntVar(0, max_dev, "eF_plus")
+    eL_minus = model.NewIntVar(0, max_dev, "eL_minus")
+    eL_plus = model.NewIntVar(0, max_dev, "eL_plus")
+    model.Add(W_SCALE * Cfield + eF_minus - eF_plus == beta["Campo"] * Cused)
+    model.Add(W_SCALE * Clab + eL_minus - eL_plus == beta["Laboratorio"] * Cused)
+    Z1 = model.NewIntVar(0, 4 * max_dev, "Z1")
+    model.Add(Z1 == eF_minus + eF_plus + eL_minus + eL_plus)
+
+    d_minus, d_plus = {}, {}
+    u_minus, u_plus = {}, {}
+    field_dev_terms, lab_dev_terms = [], []
+    for f in F:
+        d_minus[f] = model.NewIntVar(0, max_dev, f"d_minus__{f}")
+        d_plus[f] = model.NewIntVar(0, max_dev, f"d_plus__{f}")
+        model.Add(W_SCALE * Cf[f] + d_minus[f] - d_plus[f] == alpha[f] * Cfield)
+        field_dev_terms.extend([d_minus[f], d_plus[f]])
+    for k in K:
+        u_minus[k] = model.NewIntVar(0, max_dev, f"u_minus__{k}")
+        u_plus[k] = model.NewIntVar(0, max_dev, f"u_plus__{k}")
+        model.Add(W_SCALE * Ck[k] + u_minus[k] - u_plus[k] == gamma[k] * Clab)
+        lab_dev_terms.extend([u_minus[k], u_plus[k]])
+
+    Z2_field = model.NewIntVar(0, len(field_dev_terms) * max_dev, "Z2_field")
+    Z2_lab = model.NewIntVar(0, len(lab_dev_terms) * max_dev, "Z2_lab")
+    model.Add(Z2_field == sum(field_dev_terms))
+    model.Add(Z2_lab == sum(lab_dev_terms))
+    Z2 = model.NewIntVar(0, (len(field_dev_terms) + len(lab_dev_terms)) * max_dev, "Z2")
+    model.Add(Z2 == Z2_field + Z2_lab)
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = max(1, int(time_limit_per_stage))
+    solver.parameters.num_search_workers = 8
+
+    def is_good(status):
+        return status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+
+    def status_name(status):
+        return solver.StatusName(status)
+
+    def extract(stage_label: str, status: int) -> Dict:
+        cfield_val = int(solver.Value(Cfield))
+        clab_val = int(solver.Value(Clab))
+        cused_val = int(solver.Value(Cused))
+        total_time_by_shift = {w: int(sum(t[(f, w)] * solver.Value(Q[f]) for f in F)) for w in W}
+
+        field_rows = []
+        for f in F:
+            q = int(solver.Value(Q[f]))
+            day_h = int(t[(f, "Dia")] * q)
+            night_h = int(t[(f, "Noche")] * q)
+            cost = int(solver.Value(Cf[f]))
+            cost_unit_base = sum(c_h[(f, w)] * t[(f, w)] for w in W)
+            cost_unit = int(round(cost_unit_base))
+            field_rows.append({
+                "actividad": f,
+                "tipo": "puntual_base" if f == puntual else "especializado",
+                "cantidad_Q": q,
+                "techo_Q_puntual": int(solver.Value(Q[puntual])) if f != puntual else "",
+                "tiempo_dia_h": day_h,
+                "tiempo_noche_h": night_h,
+                "tiempo_total_h": day_h + night_h,
+                "c_h_Dia_COP_h": c_h[(f, "Dia")],
+                "c_h_Noche_COP_h": c_h[(f, "Noche")],
+                "costo_unitario_base_COP": int(round(cost_unit_base)),
+                "costo_unitario_campo_COP": int(round(cost_unit)),
+                "costo_COP": cost,
+                "alpha_f": alpha[f] / W_SCALE,
+                "participacion_real_campo": cost / max(1, cfield_val),
+                "minimo_por_AHP_mayor_0": 1 if alpha[f] > 0 else 0,
+            })
+
+        lab_rows = []
+        for k in K:
+            cost = int(solver.Value(Ck[k]))
+            target_cost = (gamma[k] / W_SCALE) * clab_val
+            lab_rows.append({
+                "analisis": k,
+                "muestras_L": int(solver.Value(L[k])),
+                "costo_COP": cost,
+                "gamma_k": gamma[k] / W_SCALE,
+                "participacion_objetivo_lab": gamma[k] / W_SCALE,
+                "participacion_real_lab": cost / max(1, clab_val),
+                "costo_objetivo_AHP_COP": int(round(target_cost)),
+                "desviacion_abs_COP": int(round(abs(cost - target_cost))),
+                "minimo_por_AHP_mayor_0": 1 if gamma[k] > 0 else 0,
+            })
+
+        # Plan puntual real por transecta
+        plan_rows = []
+        punctual_by_circle = []
+        for i in I:
+            chosen_s = None
+            chosen_points = None
+            for s in separations:
+                if solver.Value(y[(i, s)]) == 1:
+                    chosen_s = s
+                    chosen_points = int(n[(i, s)])
+                    break
+            cost_base = chosen_points * sum(c_h[(puntual, w)] * t[(puntual, w)] for w in W)
+            cost = int(round(cost_base))
+            day_h = chosen_points * t[(puntual, "Dia")]
+            night_h = chosen_points * t[(puntual, "Noche")]
+            punctual_by_circle.append((i, chosen_points))
+            plan_rows.append({
+                "transecta": i,
+                "longitud_m": length[i],
+                "actividad": puntual,
+                "tipo_resultado": "puntual_por_transecta",
+                "separacion_m": chosen_s,
+                "puntos": chosen_points,
+                "N_min": n_min,
+                "N_max": n_max,
+                "cumple_saturacion": bool(n_min <= chosen_points <= n_max),
+                "tiempo_dia_h": day_h,
+                "tiempo_noche_h": night_h,
+                "tiempo_total_h": day_h + night_h,
+                "costo_COP": cost,
+                "nota": "Decisión directa del solver: separación única por transecta",
+            })
+
+        # Asignación sugerida de especializados a transectas para reporte operativo.
+        base_series = pd.Series({i: pts for i, pts in punctual_by_circle})
+        for f in specialized:
+            q = int(solver.Value(Q[f]))
+            allocation = _integer_proportional_allocation(q, base_series)
+            for i, pts in allocation.items():
+                if int(pts) <= 0:
+                    continue
+                cost_base = int(pts) * sum(c_h[(f, w)] * t[(f, w)] for w in W)
+                cost = int(round(cost_base))
+                day_h = int(pts) * t[(f, "Dia")]
+                night_h = int(pts) * t[(f, "Noche")]
+                plan_rows.append({
+                    "transecta": i,
+                    "longitud_m": length[i],
+                    "actividad": f,
+                    "tipo_resultado": "especializado_sugerido_por_transecta",
+                    "separacion_m": "no aplica",
+                    "puntos": int(pts),
+                    "N_min": "no aplica",
+                    "N_max": "no aplica",
+                    "cumple_saturacion": "no aplica",
+                    "tiempo_dia_h": day_h,
+                    "tiempo_noche_h": night_h,
+                    "tiempo_total_h": day_h + night_h,
+                    "costo_COP": cost,
+                    "nota": "Q_f es decisión global; esta distribución por transecta es sugerida proporcional al muestreo puntual base",
+                })
+
+        total_samples = int(sum(int(solver.Value(Q[f])) for f in F))
+        return {
+            "stage": stage_label,
+            "status": status_name(status),
+            "objective_value": solver.ObjectiveValue(),
+            "kpis": {
+                "Presupuesto usado": cused_val,
+                "Presupuesto disponible": budget,
+                "Gasto campo": cfield_val,
+                "Gasto laboratorio": clab_val,
+                "Actividad puntual base": puntual,
+                "Muestras puntuales base": int(solver.Value(Q[puntual])),
+                "N_min puntos/transecta": n_min,
+                "N_max puntos/transecta": n_max,
+                "Equipos dia": int(solver.Value(E["Dia"])),
+                "Equipos noche": int(solver.Value(E["Noche"])),
+                "Tiempo campo dia h": total_time_by_shift["Dia"],
+                "Tiempo campo noche h": total_time_by_shift["Noche"],
+                "Muestras campo totales": total_samples,
+                "Muestras laboratorio totales": int(sum(int(solver.Value(L[k])) for k in K)),
+                "Z1 aprox COP": int(solver.Value(Z1)) / W_SCALE,
+                "Z2 aprox COP": int(solver.Value(Z2)) / W_SCALE,
+                "Z2 campo aprox COP": int(solver.Value(Z2_field)) / W_SCALE,
+                "Z2 laboratorio aprox COP": int(solver.Value(Z2_lab)) / W_SCALE,
+                "Uso presupuesto %": cused_val / max(1, budget),
+                "Presupuesto no usado": max(0, budget - cused_val),
+                "Campo real %": cfield_val / max(1, cused_val),
+                "Lab real %": clab_val / max(1, cused_val),
+                "Campo objetivo AHP %": beta["Campo"] / W_SCALE,
+                "Lab objetivo AHP %": beta["Laboratorio"] / W_SCALE,
+            },
+            "field": pd.DataFrame(field_rows),
+            "lab": pd.DataFrame(lab_rows),
+            "plan": pd.DataFrame(plan_rows),
+        }
+
+    logs = []
+    model.Minimize(Z1)
+    status1 = solver.Solve(model)
+    logs.append({"etapa": "1. Minimización de desviaciones de primer nivel", "estado": status_name(status1)})
+    if not is_good(status1):
+        return {"ok": False, "logs": logs, "error": "No se encontró solución factible en la etapa 1."}
+    best_solution = extract("Etapa 1", status1)
+    z1_value = int(solver.Value(Z1))
+    z_tol = max(W_SCALE, int(round(budget * W_SCALE * LEXI_TOL_PCT)))
+
+    model.Add(Z1 <= z1_value + z_tol)
+    model.Minimize(Z2)
+    status2 = solver.Solve(model)
+    logs.append({"etapa": "2. Minimización de desviaciones internas con Z1≈Z1*", "estado": status_name(status2)})
+    if not is_good(status2):
+        best_solution["warning"] = "La etapa 2 no encontró solución; se muestra etapa 1."
+        best_solution["logs"] = logs
+        return {"ok": True, **best_solution}
+    best_solution = extract("Etapa 2", status2)
+    z2_value = int(solver.Value(Z2))
+    z2_field_value = int(solver.Value(Z2_field))
+    z2_lab_value = int(solver.Value(Z2_lab))
+
+    model.Add(Z2 <= z2_value + z_tol)
+    model.Add(Z2_field <= z2_field_value + z_tol)
+    model.Add(Z2_lab <= z2_lab_value + z_tol)
+    model.Maximize(Cused)
+    status3 = solver.Solve(model)
+    logs.append({"etapa": "3. Maximización de presupuesto usado con coherencia AHP preservada", "estado": status_name(status3)})
+    if not is_good(status3):
+        best_solution["warning"] = "La etapa 3 no encontró solución; se muestra etapa 2."
+        best_solution["logs"] = logs
+        return {"ok": True, **best_solution}
+    final_solution = extract("Etapa 3", status3)
+    final_solution["logs"] = logs
+    return {"ok": True, **final_solution}
 
 
-with st.expander("Cargar otros Excel", expanded=False):
-    uploaded_circles = st.file_uploader("Circulos.xlsx", type=["xlsx"], key="uploaded_circles")
-    uploaded_params = st.file_uploader("Parametros.xlsx", type=["xlsx"], key="uploaded_params")
-    st.caption("Si no cargas archivos, la app usa los Excel reales incluidos en el repositorio.")
+# -----------------------------
+# Interfaz Streamlit
+# -----------------------------
 
-circles0, separations0, field0, lab0, params0 = load_real_defaults(uploaded_circles, uploaded_params)
+st.title("🧪 Optimización MILP-AHP para estrategias de muestreo")
+st.caption("Versión final: separación única por transecta, L_i como longitud de transecta, n_i,s = max(1, floor(L_i/s)+1), saturación N_min/N_max, techo físico y cotas mínimas por AHP > 0.")
 
 with st.sidebar:
-    st.header("Parámetros globales")
-    budget = st.number_input("Presupuesto total (COP)", min_value=0.0, value=params0["budget"], step=1_000_000.0, format="%.0f")
-    days = st.number_input("Días disponibles", min_value=0.1, value=params0["days"], step=1.0)
-    hours_per_day = st.number_input("Horas efectivas por día", min_value=0.1, value=params0["hours_per_day"], step=0.5)
-    daily_field_cost = st.number_input("Costo diario equipo de campo (COP/día)", min_value=0.0, value=params0["daily_field_cost"], step=100_000.0, format="%.0f")
-    max_teams = st.number_input("Máximo de equipos/sensores", min_value=1, value=int(params0["max_teams"]), step=1)
-    st.divider()
-    st.header("Pesos AHP primer nivel")
-    w_field_raw = st.number_input("Peso bloque campo", min_value=0.0, value=params0["w_field"], step=0.01, format="%.4f")
-    w_lab_raw = st.number_input("Peso bloque laboratorio", min_value=0.0, value=params0["w_lab"], step=0.01, format="%.4f")
-    total_w = w_field_raw + w_lab_raw
-    if total_w > 0:
-        w_field = w_field_raw / total_w
-        w_lab = w_lab_raw / total_w
-    else:
-        w_field = 0.5
-        w_lab = 0.5
-    st.info(f"Pesos normalizados: campo={w_field:.3f}, laboratorio={w_lab:.3f}")
-    st.divider()
-    couple_lab_to_field = st.checkbox("Acoplar análisis al total de muestras de campo", value=True)
-    time_limit_sec = st.slider("Límite de tiempo del solver (s)", 5, 300, 60)
+    st.header("1) Datos")
+    st.download_button(
+        "📥 Descargar plantilla Excel FINAL",
+        data=build_template_excel_bytes(),
+        file_name="Data_template_MILP_AHP_FINAL.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        on_click="ignore",
+    )
+    data_mode = st.radio("Origen de datos", ["Subir Excel", "Ingresar manualmente"], index=0)
+    uploaded = None
+    if data_mode == "Subir Excel":
+        uploaded = st.file_uploader("Carga tu Data.xlsx", type=["xlsx"])
 
-st.subheader("1. Datos de entrada")
+    st.header("2) Solver")
+    time_limit = st.slider("Tiempo máximo por etapa (s)", min_value=3, max_value=180, value=20, step=1)
+if data_mode == "Subir Excel":
+    if uploaded is None:
+        st.info("Carga un Excel con la plantilla modificada o usa el modo manual.")
+        st.stop()
+    try:
+        parsed = parse_excel(uploaded)
+    except Exception as exc:
+        st.error(f"No pude leer el Excel: {exc}")
+        st.stop()
+else:
+    parsed = default_manual_data()
+    st.info("Modo manual activo: edita los datos directamente en la app.")
 
+params = parsed.params
+
+st.subheader("Parámetros generales del modelo")
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Círculos", len(circles0))
-c2.metric("Presupuesto", money(budget))
-c3.metric("Días", f"{days:g}")
-c4.metric("Equipos máx.", int(max_teams))
+with c1:
+    budget = st.number_input("C_total: Presupuesto total COP", value=int(_safe_float(params.get("C_total"), 1)), min_value=1, step=1_000_000)
+with c2:
+    days = st.number_input("T_max: Días disponibles", value=int(_safe_float(params.get("T_max"), 60)), min_value=1, step=1)
+with c3:
+    hours = st.number_input("H_turno: Horas por turno", value=int(_safe_float(params.get("H_turno"), 8)), min_value=1, max_value=24, step=1)
+with c4:
+    max_teams = st.number_input("E_max: Equipos máximos por turno", value=int(_safe_float(params.get("E_max"), 3)), min_value=1, step=1)
 
-col1, col2 = st.columns([2, 1])
-with col1:
-    st.markdown("### Círculos")
-    circles = st.data_editor(circles0, num_rows="dynamic", use_container_width=True, key="circles")
-with col2:
-    st.markdown("### Separaciones permitidas")
-    separations = st.data_editor(separations0, num_rows="dynamic", use_container_width=True, key="separations")
-    st.caption("Este conjunto no venía en los Excel reales. La información queda cargada, pero puedes editarla antes de ejecutar la optimización.")
-    st.info("Tip: separaciones muy pequeñas, por ejemplo 2–10 m, aumentan mucho los puntos `ceil(perímetro/separación)` y pueden volver infactible el modelo por tiempo.")
+c5, c6 = st.columns(2)
+with c5:
+    beta_f = st.number_input("β_F: Peso global campo", value=float(_safe_float(params.get("beta_F"), 0.642)), min_value=0.0, max_value=1.0, step=0.0001, format="%.4f")
+with c6:
+    beta_l = st.number_input("β_L: Peso global laboratorio", value=float(_safe_float(params.get("beta_L"), 0.358)), min_value=0.0, max_value=1.0, step=0.0001, format="%.4f")
 
-col3, col4 = st.columns(2)
-with col3:
-    st.markdown("### Estrategias de campo")
-    field = st.data_editor(field0, num_rows="dynamic", use_container_width=True, key="field")
-with col4:
-    st.markdown("### Análisis de laboratorio")
-    lab = st.data_editor(lab0, num_rows="dynamic", use_container_width=True, key="lab")
+c7, c8 = st.columns(2)
+with c7:
+    n_min_input = st.number_input("N_min: Puntos mínimos por transecta", value=int(_safe_float(params.get("N_min"), DEFAULT_N_MIN)), min_value=1, step=1)
+with c8:
+    n_max_input = st.number_input("N_max: Puntos máximos por transecta", value=int(_safe_float(params.get("N_max"), DEFAULT_N_MAX)), min_value=1, step=1)
 
-st.subheader("2. Diagnóstico y resolución")
+if int(n_max_input) < int(n_min_input):
+    st.error("N_max debe ser mayor o igual a N_min.")
 
-col_diag, col_run = st.columns([1, 1])
-with col_diag:
-    run_diagnostic = st.button("Diagnóstico de factibilidad", type="secondary")
-with col_run:
-    run_optimization = st.button("Ejecutar optimización", type="primary")
+if abs((float(beta_f) + float(beta_l)) - 1.0) > 0.02:
+    st.warning(f"β_F + β_L debería sumar 1. Suma actual: {float(beta_f)+float(beta_l):.4f}.")
 
-if run_diagnostic:
+st.subheader("Conjuntos definidos por el usuario")
+with st.expander("I: I: Transectas / longitud total", expanded=False):
+    circles_df = st.data_editor(
+        parsed.circles,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={"Longitud_m": st.column_config.NumberColumn("L_i: Longitud total de la transecta (m)", min_value=0.01)},
+    )
+with st.expander("S: Separaciones permitidas", expanded=False):
+    separations_df = st.data_editor(
+        parsed.separations,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={"separacion_m": st.column_config.NumberColumn("s: Separación (m)", min_value=1, step=1)},
+    )
+
+left, right = st.columns(2)
+with left:
+    st.markdown("### F: Actividades de campo")
+    st.caption("La actividad puntual base usa la separación por transecta. Las demás quedan acopladas por Q_f ≤ Q_puntual y tienen mínimo Q_f ≥ 1 si α_f > 0.")
+    field_df = st.data_editor(
+        parsed.field_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "alpha_f": st.column_config.NumberColumn("α_f", min_value=0.0, max_value=1.0, format="%.4f"),
+            "t_Dia_h": st.column_config.NumberColumn("t_f,Día (h)", min_value=0, step=1),
+            "t_Noche_h": st.column_config.NumberColumn("t_f,Noche (h)", min_value=0, step=1),
+            "c_h_Dia_COP_h": st.column_config.NumberColumn("c_h,f,Día COP/h", min_value=0, step=10_000),
+            "c_h_Noche_COP_h": st.column_config.NumberColumn("c_h,f,Noche COP/h", min_value=0, step=10_000),
+        },
+    )
+with right:
+    st.markdown("### K: Análisis de laboratorio")
+    st.caption("Todo análisis con γ_k > 0 tiene mínimo L_k ≥ 1.")
+    lab_df = st.data_editor(
+        parsed.lab_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "gamma_k": st.column_config.NumberColumn("γ_k", min_value=0.0, max_value=1.0, format="%.4f"),
+            "c_lab_COP_muestra": st.column_config.NumberColumn("c_lab,k COP/muestra", min_value=0, step=100_000),
+        },
+    )
+
+try:
+    preview_circles, preview_sep, preview_field, preview_lab = clean_model_inputs(circles_df, separations_df, field_df, lab_df)
+    puntual_preview = find_puntual_activity(preview_field, params.get("actividad_puntual_base"))
+    st.info(
+        f"Actividad puntual base: {puntual_preview}. "
+        f"Suma β = {float(beta_f)+float(beta_l):.4f}; "
+        f"suma α_f = {preview_field['alpha_f'].sum():.4f}; "
+        f"suma γ_k = {preview_lab['gamma_k'].sum():.4f}."
+    )
+    sat_rows = []
+    for _, r in preview_circles.iterrows():
+        vals = [compute_n_points(float(r['Longitud_m']), int(s)) for s in preview_sep]
+        feasible = [int(s) for s, pts in zip(preview_sep, vals) if int(n_min_input) <= pts <= int(n_max_input)]
+        if not feasible:
+            sat_rows.append({
+                "transecta": r["ID"],
+                "longitud_m": float(r["Longitud_m"]),
+                "puntos_por_separacion": ", ".join(f"{int(s)} m: {pts}" for s, pts in zip(preview_sep, vals)),
+                "N_min": int(n_min_input),
+                "N_max": int(n_max_input),
+            })
+    if sat_rows:
+        st.error("Hay transectas sin separación factible con el N_min/N_max actual. Ajusta N_min, N_max o las separaciones.")
+        st.dataframe(pd.DataFrame(sat_rows), use_container_width=True)
+except Exception as preview_exc:
+    st.warning(f"Datos incompletos antes de resolver: {preview_exc}")
+
+run = st.button("🚀 Ejecutar optimización", type="primary", use_container_width=True)
+
+if run:
     try:
-        circles_c, separations_c, field_c, lab_c = clean_inputs(circles, separations, field, lab)
-        params = {
-            "budget": budget,
-            "days": days,
-            "hours_per_day": hours_per_day,
-            "daily_field_cost": daily_field_cost,
-            "max_teams": max_teams,
-            "w_field": w_field,
-            "w_lab": w_lab,
-            "couple_lab_to_field": couple_lab_to_field,
+        clean_circles, sep_list, clean_field, clean_lab = clean_model_inputs(circles_df, separations_df, field_df, lab_df)
+        actividad_base = params.get("actividad_puntual_base")
+        params_used = {
+            "C_total": int(budget),
+            "T_max": int(days),
+            "H_turno": int(hours),
+            "E_max": int(max_teams),
+            "beta_F": float(beta_f),
+            "beta_L": float(beta_l),
+            "N_min": int(n_min_input),
+            "N_max": int(n_max_input),
+            "actividad_puntual_base": find_puntual_activity(clean_field, actividad_base),
+            "separaciones": ", ".join(map(str, sep_list)),
         }
-        diag = solve_relaxed_minimums(circles_c, separations_c, field_c, lab_c, params, time_limit_sec=min(time_limit_sec, 60))
-        capacity_h = float(days) * float(hours_per_day) * int(max_teams)
-        st.markdown("### Diagnóstico rápido")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Capacidad real", f"{capacity_h:,.0f} h")
-        c2.metric("Tiempo mínimo estimado", "—" if diag["min_time_h"] is None else f"{diag['min_time_h']:,.0f} h")
-        c3.metric("Costo mínimo estimado", "—" if diag["min_cost"] is None else money(diag["min_cost"]))
-        if diag["min_time_h"] is not None and diag["min_time_h"] > capacity_h:
-            st.error(
-                "Con estas separaciones, el tiempo mínimo requerido supera la capacidad disponible. "
-                "Prueba separaciones mayores, más días, más equipos, o relaja mínimos/actividades obligatorias."
+        with st.spinner("Resolviendo modelo lexicográfico modificado..."):
+            result = solve_milp_ahp_modified(
+                circles=clean_circles,
+                separations=sep_list,
+                field_df=clean_field,
+                lab_df=clean_lab,
+                budget_cop=int(budget),
+                days_available=int(days),
+                hours_per_shift=int(hours),
+                max_teams=int(max_teams),
+                beta_field=float(beta_f),
+                beta_lab=float(beta_l),
+                time_limit_per_stage=int(time_limit),
+                actividad_puntual_base=actividad_base,
+                n_min=int(n_min_input),
+                n_max=int(n_max_input),
             )
-        elif diag["min_cost"] is not None and diag["min_cost"] > budget:
-            st.error(
-                "Con estas entradas, el costo mínimo requerido supera el presupuesto. "
-                "Prueba aumentar presupuesto o reducir mínimos/costos."
+    except Exception as exc:
+        st.session_state.last_solution_bundle = None
+        st.error(f"Error al resolver: {exc}")
+        st.stop()
+
+    if not result.get("ok"):
+        st.session_state.last_solution_bundle = None
+        st.error(result.get("error", "No se encontró solución."))
+        st.dataframe(pd.DataFrame(result.get("logs", [])), use_container_width=True)
+        if "diagnostico_saturacion" in result:
+            st.markdown("### Diagnóstico de saturación operativa")
+            st.dataframe(result["diagnostico_saturacion"], use_container_width=True)
+        st.stop()
+
+    excel_report = build_excel_report(result, clean_lab, params_used)
+    csv_report = result["plan"].to_csv(index=False).encode("utf-8")
+    lab_by_circle, lab_long = build_lab_allocation_by_circle(result["plan"], result["lab"], clean_lab)
+    st.session_state.last_solution_bundle = {
+        "result": result,
+        "clean_lab": clean_lab,
+        "params_used": params_used,
+        "excel_report": excel_report,
+        "csv_report": csv_report,
+        "lab_by_circle": lab_by_circle,
+        "lab_long": lab_long,
+    }
+
+bundle = st.session_state.get("last_solution_bundle")
+
+if bundle is not None:
+    result = bundle["result"]
+    excel_report = bundle["excel_report"]
+    csv_report = bundle["csv_report"]
+    lab_by_circle = bundle["lab_by_circle"]
+
+    if not run:
+        st.info("Se muestra la última solución calculada. Si cambiaste datos de entrada, ejecuta nuevamente la optimización.")
+    if result.get("warning"):
+        st.warning(result["warning"])
+
+    st.success(f"Solución generada: {result['stage']} | Estado solver: {result['status']}")
+    if result["status"] == "FEASIBLE":
+        st.caption("FEASIBLE significa que cumple restricciones, pero el solver no demostró optimalidad dentro del tiempo definido.")
+
+    kpis = result["kpis"]
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Presupuesto usado", f"${kpis['Presupuesto usado']:,.0f}", f"{kpis['Uso presupuesto %']:.1%}")
+    if kpis.get("Presupuesto no usado", 0) > 0:
+        st.caption(f"Presupuesto no usado: ${kpis['Presupuesto no usado']:,.0f}")
+    k2.metric("Campo", f"${kpis['Gasto campo']:,.0f}", f"{kpis['Campo real %']:.1%}")
+    k3.metric("Laboratorio", f"${kpis['Gasto laboratorio']:,.0f}", f"{kpis['Lab real %']:.1%}")
+    k4.metric("Equipos Día/Noche", f"{kpis['Equipos dia']} / {kpis['Equipos noche']}")
+
+    st.markdown("### Comparación AHP global vs asignación real")
+    global_alloc = pd.DataFrame([
+        {"bloque": "Campo", "tipo": "Objetivo AHP", "valor": kpis["Campo objetivo AHP %"]},
+        {"bloque": "Campo", "tipo": "Real", "valor": kpis["Campo real %"]},
+        {"bloque": "Laboratorio", "tipo": "Objetivo AHP", "valor": kpis["Lab objetivo AHP %"]},
+        {"bloque": "Laboratorio", "tipo": "Real", "valor": kpis["Lab real %"]},
+    ])
+    fig = px.bar(global_alloc, x="bloque", y="valor", color="tipo", barmode="group", text_auto=".1%")
+    fig.update_layout(yaxis_tickformat=".0%", yaxis_title="Participación del presupuesto", xaxis_title="")
+    st.plotly_chart(fig, use_container_width=True)
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Plan", "Campo", "Laboratorio", "Modelo usado", "Log solver"])
+    with tab1:
+        st.caption("El muestreo puntual por transecta es decisión directa del solver y debe cumplir N_min ≤ puntos_i ≤ N_max. Las actividades especializadas por transecta son una distribución sugerida de las cantidades globales Q_f.")
+        st.dataframe(result["plan"], use_container_width=True)
+        c_csv, c_xlsx = st.columns(2)
+        with c_csv:
+            st.download_button("Descargar plan CSV", data=csv_report, file_name="plan_muestreo.csv", mime="text/csv", use_container_width=True, on_click="ignore")
+        with c_xlsx:
+            st.download_button("Descargar reporte Excel multi-hoja", data=excel_report, file_name="reporte_muestreo_MILP_AHP_modificado.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, on_click="ignore")
+    with tab2:
+        st.dataframe(result["field"], use_container_width=True)
+        if not result["field"].empty:
+            field_plot = result["field"].melt(
+                id_vars="actividad",
+                value_vars=["alpha_f", "participacion_real_campo"],
+                var_name="tipo",
+                value_name="valor",
             )
-        else:
-            st.success("El diagnóstico básico no detectó una violación de tiempo o presupuesto. Puedes ejecutar la optimización completa.")
-    except Exception as exc:
-        st.error(str(exc))
-        try:
-            circles_c, separations_c, field_c, lab_c = clean_inputs(circles, separations, field, lab)
-            params = {
-                "budget": budget,
-                "days": days,
-                "hours_per_day": hours_per_day,
-                "daily_field_cost": daily_field_cost,
-                "max_teams": max_teams,
-                "w_field": w_field,
-                "w_lab": w_lab,
-                "couple_lab_to_field": couple_lab_to_field,
-            }
-            diag = solve_relaxed_minimums(circles_c, separations_c, field_c, lab_c, params, time_limit_sec=min(time_limit_sec, 60))
-            capacity_h = float(days) * float(hours_per_day) * int(max_teams)
-            st.markdown("#### Posible causa")
-            if diag["min_time_h"] is not None:
-                st.write(f"Capacidad real: **{capacity_h:,.0f} h**. Tiempo mínimo requerido con estas separaciones: **{diag['min_time_h']:,.0f} h**.")
-                if diag["min_time_h"] > capacity_h:
-                    st.warning("El modelo no alcanza la capacidad de tiempo. Usa separaciones más grandes o aumenta días/equipos.")
-            if diag["min_cost"] is not None:
-                st.write(f"Presupuesto real: **{money(budget)}**. Costo mínimo requerido: **{money(diag['min_cost'])}**.")
-                if diag["min_cost"] > budget:
-                    st.warning("El modelo no alcanza el presupuesto mínimo requerido. Aumenta presupuesto o reduce mínimos/costos.")
-        except Exception:
-            pass
-
-if run_optimization:
-    try:
-        circles_c, separations_c, field_c, lab_c = clean_inputs(circles, separations, field, lab)
-        params = {
-            "budget": budget,
-            "days": days,
-            "hours_per_day": hours_per_day,
-            "daily_field_cost": daily_field_cost,
-            "max_teams": max_teams,
-            "w_field": w_field,
-            "w_lab": w_lab,
-            "couple_lab_to_field": couple_lab_to_field,
-        }
-        objects = build_model(circles_c, separations_c, field_c, lab_c, params)
-        result = solve_lexicographic(objects, time_limit_sec=time_limit_sec)
-        summary, field_plan, field_costs, lab_plan = extract_results(objects)
-
-        st.success(f"Estado del solver: {result['status']}")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Z1 desviación primer nivel", f"{result['z1']:,.0f}")
-        c2.metric("Z2 desviación interna", f"{result['z2']:,.0f}")
-        c3.metric("Presupuesto usado", money(result["objective_budget_used"]))
-
-        st.markdown("### Resumen")
-        st.dataframe(summary, use_container_width=True)
-
-        st.markdown("### Plan de muestreo de campo")
-        st.dataframe(field_plan, use_container_width=True)
-
-        st.markdown("### Costos y cantidades de campo")
-        st.dataframe(field_costs, use_container_width=True)
-        st.bar_chart(field_costs.set_index("field_type")[["field_cost"]])
-
-        st.markdown("### Plan de laboratorio")
-        st.dataframe(lab_plan, use_container_width=True)
-        st.bar_chart(lab_plan.set_index("analysis_type")[["lab_cost"]])
-
-        excel = to_excel(
-            {
-                "summary": summary,
-                "field_plan": field_plan,
-                "field_costs": field_costs,
-                "lab_plan": lab_plan,
-                "input_circles": circles_c,
-                "input_field": field_c,
-                "input_lab": lab_c,
-            }
-        )
-        st.download_button(
-            "Descargar resultados en Excel",
-            data=excel,
-            file_name="resultados_milp_ahp.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    except Exception as exc:
-        st.error(str(exc))
-        try:
-            circles_c, separations_c, field_c, lab_c = clean_inputs(circles, separations, field, lab)
-            params = {
-                "budget": budget,
-                "days": days,
-                "hours_per_day": hours_per_day,
-                "daily_field_cost": daily_field_cost,
-                "max_teams": max_teams,
-                "w_field": w_field,
-                "w_lab": w_lab,
-                "couple_lab_to_field": couple_lab_to_field,
-            }
-            diag = solve_relaxed_minimums(circles_c, separations_c, field_c, lab_c, params, time_limit_sec=min(time_limit_sec, 60))
-            capacity_h = float(days) * float(hours_per_day) * int(max_teams)
-            st.markdown("#### Posible causa")
-            if diag["min_time_h"] is not None:
-                st.write(f"Capacidad real: **{capacity_h:,.0f} h**. Tiempo mínimo requerido con estas separaciones: **{diag['min_time_h']:,.0f} h**.")
-                if diag["min_time_h"] > capacity_h:
-                    st.warning("El modelo no alcanza la capacidad de tiempo. Usa separaciones más grandes o aumenta días/equipos.")
-            if diag["min_cost"] is not None:
-                st.write(f"Presupuesto real: **{money(budget)}**. Costo mínimo requerido: **{money(diag['min_cost'])}**.")
-                if diag["min_cost"] > budget:
-                    st.warning("El modelo no alcanza el presupuesto mínimo requerido. Aumenta presupuesto o reduce mínimos/costos.")
-        except Exception:
-            pass
-
-with st.expander("Notas del modelo implementado"):
+            fig_f = px.bar(field_plot, x="actividad", y="valor", color="tipo", barmode="group", text_auto=".1%")
+            fig_f.update_layout(yaxis_tickformat=".0%", xaxis_title="", yaxis_title="Participación dentro de campo")
+            st.plotly_chart(fig_f, use_container_width=True)
+    with tab3:
+        st.markdown("**Resumen global de laboratorio**")
+        st.dataframe(result["lab"], use_container_width=True)
+        st.markdown("**Asignación sugerida de laboratorio por transecta**")
+        st.caption("El solver decide L_k global. Esta tabla reparte cada L_k entre transectas proporcionalmente a muestras puntuales base.")
+        st.dataframe(lab_by_circle, use_container_width=True)
+        if not result["lab"].empty:
+            lab_plot = result["lab"].melt(
+                id_vars="analisis",
+                value_vars=["participacion_objetivo_lab", "participacion_real_lab"],
+                var_name="tipo",
+                value_name="valor",
+            )
+            fig_l = px.bar(lab_plot, x="analisis", y="valor", color="tipo", barmode="group", text_auto=".1%")
+            fig_l.update_layout(yaxis_tickformat=".0%", xaxis_title="", yaxis_title="Participación dentro de laboratorio")
+            st.plotly_chart(fig_l, use_container_width=True)
+    with tab4:
+        st.dataframe(model_equations_table(), use_container_width=True)
+    with tab5:
+        st.dataframe(pd.DataFrame(result.get("logs", [])), use_container_width=True)
+        st.json(kpis)
+else:
     st.markdown(
         """
-        - La cantidad de puntos por círculo y separación se calcula como `ceil(perímetro / separación)`.
-        - Las filas `min_samples` se agregan como mínimos obligatorios por estrategia o análisis.
-        - La etapa 1 minimiza desviaciones entre bloques AHP: campo vs. laboratorio.
-        - La etapa 2 minimiza desviaciones internas dentro de campo y laboratorio, fijando el resultado de la etapa 1.
-        - La etapa 3 maximiza el presupuesto utilizado, fijando las desviaciones óptimas de las etapas anteriores.
-        - Para evitar falsos `Infeasible` por tolerancia numérica, el fijado lexicográfico usa una tolerancia mínima de COP 1.000.
-        - La app incluye un diagnóstico auxiliar para estimar si una combinación de separaciones exige más horas o presupuesto del disponible.
-        - Los pesos AHP locales se normalizan automáticamente dentro de cada bloque.
-        - El archivo de parámetros original contiene algunas referencias externas. Para evitar errores en Streamlit Cloud, la app usa los valores guardados y respaldos explícitos para costos clave.
+        ### Flujo sugerido
+        1. Descarga la plantilla modificada o usa **Ingresar manualmente**.
+        2. Define transectas, separaciones, N_min/N_max, actividades de campo y análisis de laboratorio.
+        3. Ejecuta la optimización.
+        4. Descarga el reporte Excel multi-hoja; incluye `Modelo_usado` con las ecuaciones implementadas.
         """
     )
