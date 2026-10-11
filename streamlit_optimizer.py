@@ -29,18 +29,22 @@ if "last_solution_bundle" not in st.session_state:
 # - Se agrega saturación operativa por transecta: N_min <= puntos_i <= N_max.
 # - Se mantienen presupuesto, capacidad por turno, conservación de muestras y AHP.
 # - Se permite t_f,w decimal usando escalamiento interno de tiempo.
-# - Se agrega etapa 4 para minimizar la desviación total de separaciones respecto a una separación de referencia.
+# - Se agrega etapa 4 para escoger separaciones consistentes con la longitud de las transectas:
+#   monotonicidad por longitud y ajuste a una ley de potencias s_ref,i = k * L_i^p.
 # =========================================================
 
 SHIFTS = ["Dia", "Noche"]
 W_SCALE = 10_000
 TIME_SCALE = 100  # permite tiempos decimales en centésimas de hora para CP-SAT
+K_SCALE = 10_000   # escala para el factor k de la ley de potencias s_ref,i = k * L_i^p
+LPOWER_SCALE = 1_000  # escala para L_i^p
 LEXI_TOL_PCT = 0.0025
 DEFAULT_MIN_BUDGET_USE = 0.0
 DEFAULT_COSTO_DIA_COP_H = int(round(1_500_000 / 9))
 DEFAULT_COSTO_NOCHE_COP_H = 250_000
 DEFAULT_N_MIN = 1
 DEFAULT_N_MAX = 999999
+DEFAULT_P_EXP = 1.0
 
 
 @dataclass
@@ -61,6 +65,7 @@ PARAM_DEFAULTS = [
     {"Parametro": "beta_L", "Descripcion": "Peso AHP de primer nivel del bloque laboratorio", "Unidad": "proporcion", "Valor": 0.3580},
     {"Parametro": "N_min", "Descripcion": "Número mínimo de puntos puntuales requeridos por transecta", "Unidad": "puntos/transecta", "Valor": DEFAULT_N_MIN},
     {"Parametro": "N_max", "Descripcion": "Número máximo de puntos puntuales permitidos por transecta", "Unidad": "puntos/transecta", "Valor": DEFAULT_N_MAX},
+    {"Parametro": "p_exp", "Descripcion": "Exponente p de la relación separación-longitud s_ref,i = k * L_i^p", "Unidad": "adimensional", "Valor": DEFAULT_P_EXP},
     {"Parametro": "actividad_puntual_base", "Descripcion": "Nombre de la actividad base que usa separación por transecta", "Unidad": "texto", "Valor": "Muestreo puntual estándar"},
 ]
 
@@ -112,12 +117,12 @@ def build_template_excel_bytes() -> bytes:
         pd.DataFrame(DEFAULT_FIELD_ROWS).to_excel(writer, sheet_name="Campo", index=False)
         pd.DataFrame(DEFAULT_LAB_ROWS).to_excel(writer, sheet_name="Laboratorio", index=False)
         notes = pd.DataFrame([
-            {"Hoja": "Parametros", "Descripcion": "Incluye T_max, H_turno, C_total, E_max, beta_F, beta_L, N_min, N_max y actividad_puntual_base."},
+            {"Hoja": "Parametros", "Descripcion": "Incluye T_max, H_turno, C_total, E_max, beta_F, beta_L, N_min, N_max, p_exp y actividad_puntual_base."},
             {"Hoja": "Transectas", "Descripcion": "Conjunto I. Columnas: ID, Longitud_m. Longitud_m representa la longitud total de la transecta."},
             {"Hoja": "Separaciones", "Descripcion": "Conjunto S. Columna: separacion_m. El modelo elige exactamente una separación por transecta para muestreo puntual."},
             {"Hoja": "Campo", "Descripcion": "Conjunto F. Una fila debe corresponder al muestreo puntual base. Las otras actividades son especializadas y cumplen Q_f <= Q_puntual."},
             {"Hoja": "Laboratorio", "Descripcion": "Conjunto K. Si gamma_k > 0, el modelo fuerza L_k >= 1."},
-            {"Hoja": "Modelo", "Descripcion": "Saturación operativa: N_min <= puntos_i <= N_max. Cotas mínimas: si alpha_f > 0 entonces Q_f >= 1; si gamma_k > 0 entonces L_k >= 1. Conservación: sum_k L_k <= sum_f Q_f."},
+            {"Hoja": "Modelo", "Descripcion": "Saturación: N_min <= puntos_i <= N_max. Monotonicidad: transectas más largas no reciben menor separación ni menos puntos. Etapa 4: min desviación frente a s_ref,i = k * L_i^p."},
         ])
         notes.to_excel(writer, sheet_name="Notas_formato", index=False)
         for ws in writer.book.worksheets:
@@ -383,9 +388,13 @@ def model_equations_table() -> pd.DataFrame:
         ("Etapa 1", "min Z1 = eF-+eF+ + eL-+eL+"),
         ("Etapa 2", "min Z2 = sum_f(d_f-+d_f+) + sum_k(u_k-+u_k+) sujeto a Z1 <= Z1* + epsilon"),
         ("Etapa 3", "max C_used sujeto a Z1 <= Z1* + epsilon y Z2 <= Z2* + epsilon"),
+        ("Orden de transectas", "P = pares consecutivos (i,i') ordenados por longitud no decreciente L_i <= L_i'"),
         ("Separación por transecta", "s_i = sum_s s * y_i,s"),
-        ("Desviación de separación", "delta_i >= s_i - s_ref; delta_i >= s_ref - s_i"),
-        ("Etapa 4", "min sum_i delta_i preservando Z1*, Z2* y C_used*"),
+        ("Puntos puntuales por transecta", "q_i,puntual = sum_s n_i,s * y_i,s"),
+        ("Monotonicidad por longitud", "Para (i,i') en P: s_i <= s_i' y q_i,puntual <= q_i',puntual"),
+        ("Referencia por ley de potencias", "s_ref,i = k * L_i^p; k es seleccionado por el modelo"),
+        ("Desviación de referencia", "v_i >= s_i - k*L_i^p; v_i >= k*L_i^p - s_i"),
+        ("Etapa 4", "min Z4 = sum_i v_i preservando Z1*, Z2* y C_used*"),
     ]
     return pd.DataFrame(rows, columns=["Bloque", "Ecuación implementada"])
 
@@ -458,6 +467,7 @@ def solve_milp_ahp_modified(
     actividad_puntual_base=None,
     n_min: int = DEFAULT_N_MIN,
     n_max: int = DEFAULT_N_MAX,
+    p_exp: float = DEFAULT_P_EXP,
 ) -> Dict:
     circles, separations, field_df, lab_df = clean_model_inputs(circles, pd.DataFrame({"separacion_m": separations}), field_df, lab_df)
     n_min = int(round(float(n_min)))
@@ -466,6 +476,9 @@ def solve_milp_ahp_modified(
         raise ValueError("N_min debe ser mayor o igual a 1.")
     if n_max < n_min:
         raise ValueError("N_max debe ser mayor o igual a N_min.")
+    p_exp = float(p_exp)
+    if p_exp <= 0:
+        raise ValueError("p_exp debe ser mayor que cero.")
 
     validate_weight_sum("beta_F + beta_L", beta_field + beta_lab)
     validate_weight_sum("sum_f alpha_f", float(field_df["alpha_f"].sum()))
@@ -478,6 +491,8 @@ def solve_milp_ahp_modified(
     puntual = find_puntual_activity(field_df, actividad_puntual_base)
     specialized = [f for f in F if f != puntual]
     length = dict(zip(I, circles["Longitud_m"].astype(float)))
+    ordered_I = sorted(I, key=lambda _i: (float(length[_i]), str(_i)))
+    P_pairs = list(zip(ordered_I[:-1], ordered_I[1:]))
 
     budget = int(round(budget_cop))
     beta = {"Campo": int(round(beta_field * W_SCALE)), "Laboratorio": int(round(beta_lab * W_SCALE))}
@@ -530,29 +545,45 @@ def solve_milp_ahp_modified(
     Clab = model.NewIntVar(0, budget, "Clab")
     Cused = model.NewIntVar(0, budget, "Cused")
 
-    # Variables para homogeneidad de separaciones (etapa 4)
+    # Variables para consistencia separación-longitud (etapa 4)
     s_assigned = {i: model.NewIntVar(s_min, s_max, f"s_assigned__{i}") for i in I}
-    s_ref = model.NewIntVar(s_min, s_max, "s_ref")
-    delta_sep = {i: model.NewIntVar(0, max(0, s_max - s_min), f"delta_sep__{i}") for i in I}
-    Z_sep = model.NewIntVar(0, max(1, len(I) * max(0, s_max - s_min)), "Z_sep")
+    q_puntual_i = {i: model.NewIntVar(0, max_puntual, f"q_puntual__{i}") for i in I}
+
+    # k es el factor de escala en s_ref,i = k * L_i^p.
+    # Se representa como entero escalado para que CP-SAT mantenga linealidad.
+    l_power_float = {i: max(1e-9, float(length[i]) ** p_exp) for i in I}
+    l_power_scaled = {i: max(1, int(round(l_power_float[i] * LPOWER_SCALE))) for i in I}
+    k_upper = max(1, int(math.ceil((float(s_max) / max(min(l_power_float.values()), 1e-9)) * K_SCALE)))
+    k_scaled = model.NewIntVar(0, k_upper, "k_scaled")
+    REF_SCALE = K_SCALE * LPOWER_SCALE
+    max_pred_scaled = max(float(s_max) * REF_SCALE, k_upper * max(l_power_scaled.values()))
+    v_bound = max(1, int(math.ceil(max_pred_scaled)))
+    v_ref = {i: model.NewIntVar(0, v_bound, f"v_ref__{i}") for i in I}
+    Z4 = model.NewIntVar(0, max(1, len(I) * v_bound), "Z4_separacion_longitud")
 
     # 4.1.1 Selección única por transecta para muestreo puntual
     for i in I:
         model.Add(sum(y[(i, s)] for s in separations) == 1)
         model.Add(s_assigned[i] == sum(int(s) * y[(i, s)] for s in separations))
-        model.Add(delta_sep[i] >= s_assigned[i] - s_ref)
-        model.Add(delta_sep[i] >= s_ref - s_assigned[i])
-    model.Add(Z_sep == sum(delta_sep[i] for i in I))
+        model.Add(q_puntual_i[i] == sum(n[(i, s)] * y[(i, s)] for s in separations))
 
-    # 4.1.3 Restricción de saturación operativa por transecta
-    # Impide sub-muestreo y sobre-muestreo en cada transecta.
-    for i in I:
-        points_i = sum(n[(i, s)] * y[(i, s)] for s in separations)
-        model.Add(points_i >= n_min)
-        model.Add(points_i <= n_max)
+        # Saturación operativa por transecta
+        model.Add(q_puntual_i[i] >= n_min)
+        model.Add(q_puntual_i[i] <= n_max)
+
+        # Desviación absoluta frente a la referencia k * L_i^p, linearizada y escalada
+        model.Add(v_ref[i] >= int(REF_SCALE) * s_assigned[i] - k_scaled * int(l_power_scaled[i]))
+        model.Add(v_ref[i] >= k_scaled * int(l_power_scaled[i]) - int(REF_SCALE) * s_assigned[i])
+    model.Add(Z4 == sum(v_ref[i] for i in I))
+
+    # Monotonicidad sobre pares consecutivos de transectas ordenadas por longitud no decreciente.
+    # Si una transecta es más larga, no puede recibir menor separación ni menos puntos puntuales.
+    for i, ip in P_pairs:
+        model.Add(s_assigned[i] <= s_assigned[ip])
+        model.Add(q_puntual_i[i] <= q_puntual_i[ip])
 
     # 4.1.2 Cantidad total de muestras puntuales
-    model.Add(Q[puntual] == sum(n[(i, s)] * y[(i, s)] for i in I for s in separations))
+    model.Add(Q[puntual] == sum(q_puntual_i[i] for i in I))
 
     # 4.2.1 Acoplamiento lógico / techo físico
     for f in specialized:
@@ -704,8 +735,8 @@ def solve_milp_ahp_modified(
                 "actividad": puntual,
                 "tipo_resultado": "puntual_por_transecta",
                 "separacion_m": chosen_s,
-                "separacion_referencia_m": int(solver.Value(s_ref)),
-                "desviacion_separacion_m": int(solver.Value(delta_sep[i])),
+                "separacion_ref_potencia_m": round((solver.Value(k_scaled) * l_power_scaled[i]) / REF_SCALE, 4),
+                "desviacion_ref_potencia_m": round(solver.Value(v_ref[i]) / REF_SCALE, 4),
                 "puntos": chosen_points,
                 "N_min": n_min,
                 "N_max": n_max,
@@ -735,8 +766,8 @@ def solve_milp_ahp_modified(
                     "actividad": f,
                     "tipo_resultado": "especializado_sugerido_por_transecta",
                     "separacion_m": "no aplica",
-                    "separacion_referencia_m": "no aplica",
-                    "desviacion_separacion_m": "no aplica",
+                    "separacion_ref_potencia_m": "no aplica",
+                    "desviacion_ref_potencia_m": "no aplica",
                     "puntos": int(pts),
                     "N_min": "no aplica",
                     "N_max": "no aplica",
@@ -762,8 +793,9 @@ def solve_milp_ahp_modified(
                 "Muestras puntuales base": int(solver.Value(Q[puntual])),
                 "N_min puntos/transecta": n_min,
                 "N_max puntos/transecta": n_max,
-                "Separación referencia m": int(solver.Value(s_ref)),
-                "Desviación total separaciones m": int(solver.Value(Z_sep)),
+                "p exponente separación-longitud": float(p_exp),
+                "Factor k separación-longitud": round(solver.Value(k_scaled) / K_SCALE, 6),
+                "Z4 desviación total separación-longitud m": round(solver.Value(Z4) / REF_SCALE, 4),
                 "Equipos dia": int(solver.Value(E["Dia"])),
                 "Equipos noche": int(solver.Value(E["Noche"])),
                 "Tiempo campo dia h": total_time_by_shift["Dia"],
@@ -822,11 +854,12 @@ def solve_milp_ahp_modified(
     best_solution = extract("Etapa 3", status3)
     cused_value = int(solver.Value(Cused))
 
-    # Etapa 4: entre las soluciones óptimas anteriores, escoger separaciones más homogéneas
+    # Etapa 4: entre las soluciones óptimas anteriores, escoger el diseño de separaciones
+    # más consistente con la longitud de cada transecta.
     model.Add(Cused >= cused_value)
-    model.Minimize(Z_sep)
+    model.Minimize(Z4)
     status4 = solver.Solve(model)
-    logs.append({"etapa": "4. Homogeneización de separaciones entre transectas", "estado": status_name(status4)})
+    logs.append({"etapa": "4. Consistencia separación-longitud por ley de potencias", "estado": status_name(status4)})
     if not is_good(status4):
         best_solution["warning"] = "La etapa 4 no encontró solución; se muestra etapa 3."
         best_solution["logs"] = logs
@@ -842,7 +875,7 @@ def solve_milp_ahp_modified(
 # -----------------------------
 
 st.title("🧪 Optimización MILP-AHP para estrategias de muestreo")
-st.caption("Versión final: transectas, tiempos decimales, homogeneidad de separaciones como etapa 4, saturación N_min/N_max, techo físico y cotas mínimas por AHP > 0.")
+st.caption("Versión final: transectas, tiempos decimales, saturación N_min/N_max, monotonicidad por longitud y etapa 4 con ley de potencias s_ref,i = k·L_i^p.")
 
 with st.sidebar:
     st.header("1) Datos")
@@ -893,11 +926,13 @@ with c5:
 with c6:
     beta_l = st.number_input("β_L: Peso global laboratorio", value=float(_safe_float(params.get("beta_L"), 0.358)), min_value=0.0, max_value=1.0, step=0.0001, format="%.4f")
 
-c7, c8 = st.columns(2)
+c7, c8, c9 = st.columns(3)
 with c7:
     n_min_input = st.number_input("N_min: Puntos mínimos por transecta", value=int(_safe_float(params.get("N_min"), DEFAULT_N_MIN)), min_value=1, step=1)
 with c8:
     n_max_input = st.number_input("N_max: Puntos máximos por transecta", value=int(_safe_float(params.get("N_max"), DEFAULT_N_MAX)), min_value=1, step=1)
+with c9:
+    p_exp_input = st.number_input("p: Exponente separación-longitud", value=float(_safe_float(params.get("p_exp", params.get("p")), DEFAULT_P_EXP)), min_value=0.01, max_value=5.0, step=0.05, format="%.2f")
 
 if int(n_max_input) < int(n_min_input):
     st.error("N_max debe ser mayor o igual a N_min.")
@@ -992,6 +1027,7 @@ if run:
             "beta_L": float(beta_l),
             "N_min": int(n_min_input),
             "N_max": int(n_max_input),
+            "p_exp": float(p_exp_input),
             "actividad_puntual_base": find_puntual_activity(clean_field, actividad_base),
             "separaciones": ", ".join(map(str, sep_list)),
         }
@@ -1011,6 +1047,7 @@ if run:
                 actividad_puntual_base=actividad_base,
                 n_min=int(n_min_input),
                 n_max=int(n_max_input),
+                p_exp=float(p_exp_input),
             )
     except Exception as exc:
         st.session_state.last_solution_bundle = None
@@ -1078,7 +1115,7 @@ if bundle is not None:
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["Plan", "Campo", "Laboratorio", "Modelo usado", "Log solver"])
     with tab1:
-        st.caption("El muestreo puntual por transecta es decisión directa del solver y debe cumplir N_min ≤ puntos_i ≤ N_max. Las actividades especializadas por transecta son una distribución sugerida de las cantidades globales Q_f.")
+        st.caption("El muestreo puntual por transecta es decisión directa del solver, cumple N_min ≤ puntos_i ≤ N_max y respeta la monotonicidad por longitud. Las actividades especializadas por transecta son una distribución sugerida de las cantidades globales Q_f.")
         st.dataframe(result["plan"], use_container_width=True)
         c_csv, c_xlsx = st.columns(2)
         with c_csv:
@@ -1123,7 +1160,7 @@ else:
         """
         ### Flujo sugerido
         1. Descarga la plantilla modificada o usa **Ingresar manualmente**.
-        2. Define transectas, separaciones, N_min/N_max, actividades de campo y análisis de laboratorio.
+        2. Define transectas, separaciones, N_min/N_max, el exponente p, actividades de campo y análisis de laboratorio.
         3. Ejecuta la optimización.
         4. Descarga el reporte Excel multi-hoja; incluye `Modelo_usado` con las ecuaciones implementadas.
         """
